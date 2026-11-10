@@ -27,8 +27,8 @@ mobile UI and Web Push relay. There is no database and no build step: plain ES m
 | `lib/warrants.mjs` | Warrant tracking (Taiwan, call warrants only, pure): FinMind warrant→underlying lookup (`TaiwanStockInfoWithWarrantSummary`, reused codes resolved by listing/last-trading date), TWSE `MI_INDEX` type 0999 and TPEx `tpex_warrant_daily_quts` quote parsing (`callWarrantQuotes` in `providers/twse.mjs`), issuer from the warrant name (the issuer head office's own warrants are excluded), per-branch aggregation by underlying (net amount, share of the underlying's call-warrant turnover, streaks; big-buy and consecutive-buy signals), and the per-stock warrant list. The broker watch queries `/taiwan_stock_warrant_trading_daily_report` once per tracked branch; APIs `GET /api/warrants?id=`, `GET /api/warrants/brokers?wid=&date=`; cache `.local/warrants/` |
 | `lib/chipwatch.mjs` | Chip tracking (Taiwan, FinMind Sponsor): broker-branch tracking (one by-branch request per tracked branch after 18:30, `.local/broker-watch/<date>.json`, streaks; alerts for one-day dominance — net buying as a share of the day's volume plus a minimum amount — and multi-day accumulation as a share of total shares in custody) and the big-holder concentration ranking (whole-market shareholding table per week, `.local/holders-all/<date>.json`, 1- and 4-week change). APIs `/api/chipwatch*`, `/api/holders/rank*`; `POST /api/chipwatch/query` runs in the background (202) and the pages poll `GET /api/chipwatch?date=` for progress (`busy`, `query`) |
 | `lib/stream.mjs` | Live-stream client (WebSocket): auth, per-channel batched subscriptions, heartbeat check, reconnect with backoff, events flushed in batches; `createStreamPool` spreads symbols over several connections |
-| `lib/daytrade.mjs` | Day-trade engine (pure): per-stock state from trades / 1-minute bars / order book (or aggregates), VWAP, same-time volume baseline from the time machine, order-book imbalance, multi-timeframe score, three long opportunities and two risk alerts, exclusions, backfill, after-close evaluation and versioned review statistics |
-| `lib/daytrade-context.mjs`, `lib/daytrade-history.mjs` | 30-session adjusted daily/minute history, completed 5m/60m aggregation, time-weighted full-depth book confirmation, watchlist history queue/cache |
+| `lib/daytrade.mjs` | Day-trade engine (pure): per-stock state from trades / 1-minute bars / order book (or aggregates), VWAP, 5-minute bar state per watch-list stock, three signals (close above the 20MA = long; close below the 20MA or below the opening low = short), exclusions, backfill, previous-session turnover ranking, after-close review for both sides |
+| `lib/daytrade-context.mjs`, `lib/daytrade-history.mjs` | 5-minute helpers (1-minute → 5-minute aggregation, 20MA cross, opening low) and the queue/cache that loads the previous sessions' 5-minute bars (one historical request per stock) |
 | `lib/daytrade-market.mjs` | Day-trade market context (pure, record-only): per-index minute series (TAIEX / TPEx) fed from snapshot rows `001`/`101` or Fugle index candles, change, 15-minute change, time-weighted intraday average, breadth; tailwind / neutral / headwind and relative-strength rules; the `market` record stored with each signal and used to group the review |
 | `lib/patterns.mjs`, `lib/pattern-service.mjs` | Pattern detection and the whole-market pattern snapshot |
 | `lib/grouprank.mjs` | Research-group ranking (turnover-weighted gain) |
@@ -75,21 +75,27 @@ changes. Stream rows use the live-snapshot format plus `volume_at_bid` / `volume
 for subscribed stocks and snapshot rows for the rest, and quotes use whichever row is newer. The heatmap and time machine
 keep using snapshots. The key is sent only in the auth message, never in the URL.
 
-Day-trade monitoring (Taiwan): with day-trade monitoring on and enough subscriptions (e.g. Fugle Advanced), the stream
-runs in full mode — trades, 1-minute bars and order book per stock, split over two connections by sorted symbol — and
-`lib/daytrade.mjs` turns the events into snapshot rows (so the radar and board keep working) plus scores and signals.
-Otherwise it runs in lite mode (aggregates). `auto` plan tries full mode and falls back to lite for the day when the
-subscriptions come up short. Pre-market data comes from the `dayTrade` capability (FinMind: day-trade list,
-suspensions, sell-first bans, reference prices) and TWSE/TPEx disposition lists. After a reconnect (or a mid-session
-start) every stock is backfilled through `streamBackfill` before it can signal again. Signals go to the radar
-(`dt-*` alert types) and push; after the close they are evaluated against 1-minute bars and stored in
-`.local/daytrade/<date>.json`. APIs: `GET /api/daytrade`, `GET /api/daytrade/review`, `POST /api/daytrade/settings`.
-V2 scans all research groups plus the watchlist by default (`scope: watchlist` limits it to the watchlist). Full mode prioritizes the watchlist; missing history, incomplete candles, stale books or failed backfill pause entry alerts. Risk alerts bypass entry scores and continue until 13:25. See the linked guide for exact defaults and limitations.
+Day-trade monitoring (Taiwan): the watch list is the previous session's highest-turnover stocks (shares traded ÷ TDCC
+share count, ranked once before the open from the heatmap record and the latest whole-market shareholding file) plus
+every stock in the research groups; both sources, and the personal watchlist, are switches in the settings. Watch-list
+stocks are added to the stream. Full mode — trades, 1-minute bars and order book per stock, split over the plan's
+connections by sorted symbol — is used when the watchlist and the watch list both fit; otherwise lite mode (aggregates,
+one subscription per stock). `auto` plan tries full mode and falls back to lite for the day when the subscriptions come
+up short. `lib/daytrade.mjs` turns the events into snapshot rows (so the radar and board keep working) and, three
+seconds after each 5-minute bar ends, checks the watch-list stocks once: close above the 20MA (long), close below the
+20MA (short), close below the opening low (short). The 20MA runs across sessions, so `lib/daytrade-history.mjs` loads
+the previous sessions' 1-minute bars (one Fugle historical request per stock, cached for the day as 5-minute bars).
+Pre-market data comes from the `dayTrade` capability (FinMind: day-trade list, suspensions, sell-first bans, reference
+prices) and TWSE/TPEx disposition lists. After a reconnect (or a mid-session start) every stock is backfilled through
+`streamBackfill` before it can signal again. Signals go to the radar (`dt-ma-up`, `dt-ma-down`, `dt-open-low`) and
+push — Pocket sends the signals of one bar as a single notification; after the close they are evaluated against
+1-minute bars (long: buy then sell; short: sell then buy back) and stored in `.local/daytrade/<date>.json`.
+APIs: `GET /api/daytrade`, `GET /api/daytrade/review`, `POST /api/daytrade/settings`.
 Market context (record only): every signal stores a `market` record for its own index — TAIEX for listed stocks, TPEx
 for OTC stocks — taken from the snapshot index rows every 10 seconds (no extra requests); when the snapshot has no index
 rows for 90 seconds, or a mid-session start misses the open, the server polls Fugle index quote + 1-minute candles at most
-once a minute per index. `GET /api/daytrade` returns the current `market` state; `GET /api/daytrade/review` groups v2 long
-signals by regime and relative strength. Scores, thresholds and alerts do not use it.
+once a minute per index. `GET /api/daytrade` returns the current `market` state; `GET /api/daytrade/review` groups long
+signals by regime and relative strength. Signals and alerts do not use it.
 Details and formulas: [DAYTRADE.zh-TW.md](DAYTRADE.zh-TW.md), [features/daytrade-market.md](features/daytrade-market.md).
 
 All providers return the internal row format (FinMind field names, so scoring and patterns work unchanged):

@@ -116,10 +116,10 @@ const alerts = [
   A('09:05:12', 'volume', '3324', '爆量', '預估全日量為昨量 3.2 倍，成交金額 18.6 億'),
   A('09:18:40', 'surge-up', '2421', '急拉', '1 分鐘內上漲 2.4%'),
   A('09:31:05', 'limit-up', '3324', '觸及漲停', '漲停價 869.00'),
-  A('09:42:18', 'dt-breakout', '3017', '多週期爆量突破', '30 日日 K 與 60 分 K 偏多；5 分量 2.6 倍；五檔 OBI 0.42、變化 0.12；參考停損 1,045'),
+  A('09:40:03', 'dt-ma-up', '3017', '突破 20MA（多方）', '5 分 K 收 1,018，站上 20MA 1,012.4（前一根收 1,010，在均線 1,011.8 之下）', { side: 'long' }),
   A('10:05:33', 'custom', '2330', '自訂提醒', '台積電 站上 1,450（現價 1,455）'),
   A('10:12:47', 'surge-down', '2609', '急殺', '1 分鐘內下跌 2.1%'),
-  A('10:26:09', 'dt-vwap', '6669', '多週期回測轉強', '5 分 K 回測 VWAP 後突破前棒高點；量比 1.6 倍；參考停損 2,710'),
+  A('10:25:03', 'dt-open-low', '2609', '跌破開盤低點（空方）', '5 分 K 收 71.2，跌破開盤低點 71.6', { side: 'short' }),
   A('10:58:21', 'limit-up', '2421', '觸及漲停', '漲停價 129.50'),
   A('11:20:02', 'pattern-entry', '2368', '型態進場', '杯柄突破條件進場價 360.0'),
   A('12:41:30', 'stop', '1519', '跌破防守', '跌破結構防守價 790'),
@@ -131,9 +131,10 @@ W(`alerts-${LAST}.json`, alerts.map((a, i) => ({ ...a, seq: 1760000000000 + i, a
 // 當沖訊號紀錄（收盤檢討過）
 const out = (r15, rClose = r15 / 2) => ({ r5: Math.round(r15 * 50) / 100, r15, r30: Math.round(r15 * 120) / 100, rClose, mfe: Math.round((Math.abs(r15) + 0.4) * 100) / 100, mae: Math.round((-0.3 - Math.max(0, -r15)) * 100) / 100, cost: 0.435 });
 const mk = (r15, vsAvg, rs15) => ({ index: 'twse', chg: 0.6, r15, vsAvg, rs15, stock: { chg: 2, r15: r15 + rs15 }, rs: 1.4 });
-const sig = (date, type, t, id, price, o, m) => ({ type, version: 2, purpose: 'opportunity', id, name: name.get(id), t, m: 600, price, score: 82, outcome: o, market: m });
-for (const [d, list] of [[PREV, [sig(PREV, 'dt-breakout', '09:44:10', '2368', 352, out(0.62), mk(0.15, 0.1, 0.4)), sig(PREV, 'dt-vwap', '10:31:00', '2382', 296, out(-0.48), mk(-0.4, -0.1, -0.2)), sig(PREV, 'dt-bid', '11:02:40', '3037', 184, out(0.21), mk(0.05, 0.2, 0.3))]],
-  [LAST, [sig(LAST, 'dt-breakout', '09:42:18', '3017', 1048, out(1.35), mk(0.3, 0.2, 1.1)), sig(LAST, 'dt-vwap', '10:26:09', '6669', 2745, out(0.44), mk(0.12, 0.15, 0.3)), sig(LAST, 'dt-breakout', '11:15:30', '3044', 233.5, out(-0.71), mk(-0.62, 0.05, -0.3)), { type: 'dt-weak', version: 2, purpose: 'risk', id: '2382', name: '廣達', t: '12:20:00', m: 740, price: 299, outcome: null }]]])
+const SIDE = { 'dt-ma-up': 'long', 'dt-ma-down': 'short', 'dt-open-low': 'short' };
+const sig = (date, type, t, id, price, o, m) => ({ type, side: SIDE[type], version: 3, id, name: name.get(id), t, m: 600, price, outcome: o, market: m });
+for (const [d, list] of [[PREV, [sig(PREV, 'dt-ma-up', '09:45:03', '2368', 352, out(0.62), mk(0.15, 0.1, 0.4)), sig(PREV, 'dt-ma-down', '10:30:03', '2382', 296, out(-0.48), mk(-0.4, -0.1, -0.2)), sig(PREV, 'dt-open-low', '11:05:03', '3037', 184, out(0.21), mk(0.05, 0.2, 0.3))]],
+  [LAST, [sig(LAST, 'dt-ma-up', '09:40:03', '3017', 1018, out(1.35), mk(0.3, 0.2, 1.1)), sig(LAST, 'dt-ma-up', '10:20:03', '6669', 2745, out(0.44), mk(0.12, 0.15, 0.3)), sig(LAST, 'dt-ma-down', '10:10:03', '1519', 803, out(0.52), mk(-0.62, 0.05, -0.3)), sig(LAST, 'dt-open-low', '10:25:03', '2609', 71.2, out(-0.33), mk(0.1, 0.1, -0.5))]]])
   W(`daytrade/${d}.json`, { date: d, mode: 'full', plan: 'advanced', costs: { feeRate: 0.001425, feeDiscount: 0.28, taxRate: 0.0015, slipTicks: 1 }, closedAt: `${d}T05:40:00Z`, signals: list });
 
 // 話題追蹤（人工判讀的事件）

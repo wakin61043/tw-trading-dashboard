@@ -60,7 +60,7 @@ export const data = {
   snapshotLimit: () => { const p = pick('snapshot'); return p ? (p.snapshotLimit?.(providerInfo()[p.id]) ?? null) : null; },
   // 即時推播的補資料（REST）：由提供推播的資料源執行
   streamBackfill: async (id, opts) => { const p = pick('stream'); if (!p?.streamBackfill) return null; return p.streamBackfill(id, await ctxOf(p, opts)); },
-  streamHistory: async (id, date, opts) => { const p = pick('stream'); if (!p?.streamHistory) throw new DataError('即時資料源不支援 30 日多週期歷史'); return p.streamHistory(id, date, await ctxOf(p, opts)); },
+  streamHistory: async (id, date, opts) => { const p = pick('stream'); if (!p?.streamHistory) throw new DataError('即時資料源不支援歷史分 K'); return p.streamHistory(id, date, await ctxOf(p, opts)); },
   // 當日全部逐筆成交（REST，五檔錄製器收盤後補齊只錄五檔的股票）
   // 個股即時明細與指數（由提供推播的資料源執行，目前為富果）
   streamQuote: async (id, opts) => { const p = pick('stream'); if (!p?.quoteDetail) return null; return p.quoteDetail(id, await ctxOf(p, opts)); },

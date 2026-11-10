@@ -1,21 +1,28 @@
 // 截圖與商店版 App 示意模式共用的示意資料：當沖觀察名單（盤中才有內容）與大盤分時走勢（示意資料沒有指數分時資料）
-const ctx = (d, h, vr, sup, res, obi, delta) => ({ ready: true, reasons: [], conditions: { breakout: vr >= 2, vwap: false, bid: false, weak: false }, daily: { long: d, count: 30, ma20: 0 }, hour: { long: h, count: 24, ma20: 0 }, five: { volumeRatio: vr, support: sup, resistance: res }, book: { obi, delta, age: 1.2 } });
-// st：Nexus /api/state 的股票（Map：代號 → 股票），價格與均線取自示意資料
+// st：Nexus /api/state 的股票（Map：代號 → 股票），價格取自示意資料；20MA 與開盤低點依現價推算
 export function dayTradeScan(st) {
-  const item = (id, name, _p, _c, _v, score, part, c, last, stop) => { const s = st.get(id), price = s.price, change = s.change, vwap = Math.round(price * 0.986 * 100) / 100;
-    c.daily.ma20 = s.technical?.ma20 ?? null; c.hour.ma20 = Math.round(price * 0.975 * 100) / 100; c.five.support = Math.round(price * 0.985 * 10) / 10; c.five.resistance = Math.round(price * 0.996 * 10) / 10;
-    return { id, name, price, change, vwap, vwapDist: 1.42, rvol: Math.round(c.five.volumeRatio * 1.3 * 100) / 100, obi: c.book.obi, outer5: 62, score, part, filters: [], context: c, reference: stop ? { stop: Math.round(price * 0.982) } : null, last, watch: true, scan: true }; };
+  const r2 = v => Math.round(v * 100) / 100, TITLE = { 'dt-ma-up': '突破 20MA（多方）', 'dt-ma-down': '跌破 20MA（空方）', 'dt-open-low': '跌破開盤低點（空方）' };
+  // dist：現價與 20MA 的距離（%）；turnover：前一日周轉率（高周轉率名單才有）；last：最近訊號
+  const item = (id, name, dist, turnover, last, belowOpen = false) => { const s = st.get(id); if (!(s?.price > 0)) return null; const price = s.price, ma20 = r2(price / (1 + dist / 100)), openLow = r2(price * (belowOpen ? 1.006 : 0.985));
+    return { id, name, watch: false, scan: true, turnover, grouped: true, price, change: s.change, vwap: r2(price * 0.992), five: { end: '10:35', close: price, ma20, dist, above: dist > 0, bars: 61, openLow, belowOpen }, filters: [], pending: false, reasons: [], last, at: '10:36:12' }; };
+  const top = [
+    item('3017', '奇鋐', 0.42, 6.85, { type: 'dt-ma-up', side: 'long', t: '10:35:03' }),
+    item('2609', '陽明', -0.61, 4.12, { type: 'dt-open-low', side: 'short', t: '10:35:03' }, true),
+    item('6669', '緯穎', 0.88, null, { type: 'dt-ma-up', side: 'long', t: '10:20:03' }),
+    item('1519', '華城', -0.37, 5.4, { type: 'dt-ma-down', side: 'short', t: '10:10:03' }),
+    item('2368', '金像電', 0.06, 3.96, null),
+    item('3037', '欣興', -0.12, null, null),
+    item('2382', '廣達', 0.31, null, null),
+  ].filter(Boolean);
+  const sig = (x, type, t) => ({ type, side: type === 'dt-ma-up' ? 'long' : 'short', id: x.id, name: x.name, t, price: x.price, turnover: x.turnover,
+    detail: type === 'dt-open-low' ? `5 分 K 收 ${x.price}，跌破開盤低點 ${x.five.openLow}` : `5 分 K 收 ${x.price}，${type === 'dt-ma-up' ? '站上' : '跌破'} 20MA ${x.five.ma20}`, title: TITLE[type], bar: { close: x.price, ma20: x.five.ma20, openLow: x.five.openLow } });
+  const by = Object.fromEntries(top.map(x => [x.id, x])), signals = [['3017', 'dt-ma-up', '10:35:03'], ['2609', 'dt-open-low', '10:35:03'], ['2609', 'dt-ma-down', '10:25:03'], ['6669', 'dt-ma-up', '10:20:03'], ['1519', 'dt-ma-down', '10:10:03'], ['2368', 'dt-ma-up', '09:40:03']].filter(([id]) => by[id]).map(([id, type, t]) => sig(by[id], type, t));
   return {
     phaseName: '掃描中', market: { twse: { chg: 0.62, r15: 0.18, avg: 23102.3, vsAvg: 0.21, up: 612, down: 301, regime: 'tailwind', stale: false }, tpex: { chg: 0.48, r15: -0.06, avg: 261.4, vsAvg: 0.12, up: 455, down: 330, regime: 'neutral', stale: false } },
-    feed: { window: true, connected: true, mode: 'full', subscribed: 132, expected: 132, connections: [1, 2] }, plan: 'advanced', plans: { advanced: { limit: 2000 } },
-    prep: { eligible: 1612, disposition: 14, suspended: 3, sellFirstOff: 22, ref: 1980, errors: [] }, marketChange: 1.12, history: Array.from({ length: 43 }, () => ({ status: 'ready' })), total: 43, displayMin: 70, hidden: 31,
-    top: [
-      item('3017', '奇鋐', 1048, 4.28, 1031.6, 92, { daily: 20, hour: 25, five: 27, book: 20 }, ctx(true, true, 2.6, 1032, 1045, 0.42, 0.12), { type: 'dt-breakout', t: '09:42:18' }, 1029),
-      item('6669', '緯穎', 2745, 3.58, 2721.4, 88, { daily: 20, hour: 25, five: 23, book: 20 }, ctx(true, true, 1.7, 2712, 2740, 0.36, 0.08), { type: 'dt-vwap', t: '10:26:09' }, 2705),
-      item('2368', '金像電', 361.5, 2.12, 357.9, 81, { daily: 20, hour: 25, five: 21, book: 15 }, ctx(true, true, 1.5, 356, 361, 0.27, 0.04), null, null),
-      item('3037', '欣興', 190.5, 1.88, 188.7, 76, { daily: 20, hour: 25, five: 18, book: 13 }, ctx(true, true, 1.3, 187.5, 190, 0.22, 0.03), null, null),
-      item('2382', '廣達', 299.5, 1.01, 300.2, 72, { daily: 20, hour: 25, five: 14, book: 13 }, ctx(true, true, 1.1, 297.5, 301, 0.18, -0.02), null, null),
-    ],
+    feed: { window: true, connected: true, mode: 'full', subscribed: 279, expected: 279, connections: [1, 2] }, plan: 'advanced', plans: { advanced: { limit: 2000 } },
+    prep: { eligible: 1612, disposition: 14, suspended: 3, sellFirstOff: 22, ref: 1980, turnover: { date: '2026-10-15', sharesDate: '2026-10-09', ranked: 500, picked: 50, minRate: 3.12 }, errors: [] },
+    sources: { total: 93, subscribed: 93, turnover: 50, groups: 43, watchlist: 0 }, history: { total: 93, ready: 91, short: 2, errors: [] },
+    counts: { long: 52, short: 36, waiting: 5 }, excluded: { disposition: 2 }, marketChange: 1.12, total: 93, listed: 93, top, signals, signalCount: 18,
   };
 }
 // 大盤分時：從昨收平滑走到收盤價，量在開收盤較大

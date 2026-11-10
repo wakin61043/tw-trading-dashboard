@@ -99,30 +99,15 @@ export default {
     batch: 50,
     parse: streamEvent,
   },
-  // 最近 30 交易日：還原日 K 與同基準分 K；原始日 K 提供量額及參考價核對。
+  // 當沖監控的歷史資料：今天以前最近幾個交易日的 1 分 K（由引擎彙整成 5 分 K，計算跨日的 20MA）。
+  // 每檔 1 次歷史請求（歷史 API 每分鐘 60 次）；查 14 個日曆日以涵蓋連假，只保留最後 3 個交易日。價格為原始成交價，
+  // 除權息日由引擎以今天的參考價換算。
   async streamHistory(id, date, ctx) {
-    const to = addDays(date, -1), from = addDays(date, -90);
-    const raw = await get(`/historical/candles/${id}?timeframe=D&from=${from}&to=${to}&sort=asc&fields=open,high,low,close,volume,turnover`, ctx);
-    const adjusted = await get(`/historical/candles/${id}?timeframe=D&from=${from}&to=${to}&sort=asc&fields=open,high,low,close,volume&adjusted=true`, ctx);
-    const rows = (adjusted?.data || []).filter(b => b.date < date && b.close > 0).sort((a, b) => a.date.localeCompare(b.date)).slice(-30);
-    if (!rows.length) return { daily: [], minutes: [], source: 'fugle' };
-    const original = new Map((raw?.data || []).map(b => [b.date, b]));
-    const factors = new Map(rows.filter(b => original.get(b.date)?.close > 0).map(b => [b.date, b.close / original.get(b.date).close]));
-    // 1 分 K：每 15 個交易日一次請求（30 日共 2 次，歷史 API 每分鐘只有 60 次），再依日期分開；
-    // 某個交易日在區間回應中沒有資料時才單獨補抓那一天（避免回應被截斷造成缺日）
-    const byDay = new Map(), minuteUrl = (a, b) => `/historical/candles/${id}?timeframe=1&from=${a}&to=${b}&sort=asc&fields=open,high,low,close,volume`;
-    const take = candles => { for (const c of candles?.data || []) { const d = String(c.date).slice(0, 10); if (!byDay.has(d)) byDay.set(d, []); byDay.get(d).push(c); } };
-    for (let i = 0; i < rows.length; i += 15) { const part = rows.slice(i, i + 15); take(await get(minuteUrl(part[0].date, part.at(-1).date), ctx)); }
-    for (const b of rows) if (!byDay.has(b.date) && b.volume > 0) take(await get(minuteUrl(b.date, b.date), ctx));
-    const minutes = [];
-    for (const b of rows) {
-      const factor = factors.get(b.date); if (!(factor > 0)) continue;
-      for (const c of (byDay.get(b.date) || []).sort((x, y) => String(x.date).localeCompare(String(y.date)))) {
-        const time = Date.parse(c.date); if (!Number.isFinite(time)) continue;
-        minutes.push({ time, o: c.open * factor, h: c.high * factor, l: c.low * factor, c: c.close * factor, v: c.volume });
-      }
-    }
-    return { daily: rows.map(b => ({ date: b.date, o: b.open, h: b.high, l: b.low, c: b.close, v: b.volume / 1000, amount: original.get(b.date)?.turnover ?? null })), minutes, rawClose: original.get(rows.at(-1).date)?.close, source: 'fugle' };
+    const body = await get(`/historical/candles/${id}?timeframe=1&from=${addDays(date, -14)}&to=${addDays(date, -1)}&sort=asc&fields=open,high,low,close,volume`, ctx);
+    const dayOf = time => new Date(time + 8 * 3600e3).toISOString().slice(0, 10);
+    const rows = (body?.data || []).map(c => ({ time: Date.parse(c.date), o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume })).filter(b => Number.isFinite(b.time) && dayOf(b.time) < date);
+    const keep = new Set([...new Set(rows.map(b => dayOf(b.time)))].sort().slice(-3));
+    return { minutes: rows.filter(b => keep.has(dayOf(b.time))), source: 'fugle' };
   },
   // 個股即時明細（沒有即時推播訂閱的股票，例如 ETF、研究名單以外）：報價（五檔、累計量、均價）、最近 40 筆成交、當日 1 分 K（3 次盤中 REST）
   async quoteDetail(id, ctx) {

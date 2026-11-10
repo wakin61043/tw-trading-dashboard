@@ -1,46 +1,43 @@
 // 當沖監控引擎（台股）：盤中把富果 WebSocket 的逐筆成交、1 分 K、五檔委買賣（或精簡模式的聚合行情）整理成每檔的即時狀態，
-// 以 30 日日 K、完成的 60／5 分 K、VWAP 與連續五檔變化確認觀察名單做多機會，另發轉弱與參考停損提醒。
-// 分數及門檻是研究初值，尚未回測；收盤後只檢討做多機會扣除成本後的結果。
-// 純計算模組：資料取得、排程與推播在 server.mjs；時間一律用毫秒時間戳，交易所當地時間以固定時差換算。
-import { elapsedTrading, tickSize, hhmm, minuteOf, limitPrices } from './markets.mjs';
+// 只觀察 5 分 K：觀察名單內的股票，5 分 K 收盤突破 20MA 發多方訊號；跌破 20MA、或跌破當日開盤低點發空方訊號。
+// 訊號只在 5 分 K 走完時判斷一次；門檻尚未回測，收盤後以分 K 檢討每個訊號扣除成本後的結果。
+// 純計算模組：資料取得、觀察名單、排程與推播在 server.mjs；時間一律用毫秒時間戳，交易所當地時間以固定時差換算。
+import { tickSize, hhmm, minuteOf, limitPrices } from './markets.mjs';
 import { t } from './i18n.mjs';
-import { prepareContext, analyzeContext, appendBook, contextDate, validBar } from './daytrade-context.mjs';
+import { prepareHistory, fiveMinuteBars, maState, openLowState, contextDate, validBar, MA_PERIOD } from './daytrade-context.mjs';
 import { createMarketTracker, marketRecord, regimeOf, regimeKey, strengthKey, INDEX_KEYS, MARKET_RULES, REGIMES, STRENGTHS } from './daytrade-market.mjs';
 
-export const DT_TYPES = { breakout: 'dt-breakout', vwap: 'dt-vwap', bid: 'dt-bid', weak: 'dt-weak', risk: 'dt-risk' };
-export const DT_TITLES = { 'dt-breakout': '多週期爆量突破', 'dt-vwap': '多週期回測轉強', 'dt-bid': '五檔增強確認', 'dt-weak': '多單轉弱警示', 'dt-risk': '跌破參考停損', 'dt-stop': '停止新增部位' };
-export const signalTitle = s => (s.version === 2 ? DT_TITLES : { 'dt-breakout': '爆量突破', 'dt-vwap': 'VWAP 趨勢延續', 'dt-bid': '買盤持續增強' })[s.type] || DT_TITLES[s.type] || s.type;
-// 分數權重（研究用初始值）：日 K 20、60 分 K 25、5 分 K 30、五檔 25
-export const DT_WEIGHTS = Object.freeze({ daily: 20, hour: 25, five: 30, book: 25 });
+export const DT_VERSION = 3;
+export const DT_TYPES = { maUp: 'dt-ma-up', maDown: 'dt-ma-down', openLow: 'dt-open-low' };
+export const DT_SIDES = { 'dt-ma-up': 'long', 'dt-ma-down': 'short', 'dt-open-low': 'short' };
+export const DT_TITLES = { 'dt-ma-up': '突破 20MA（多方）', 'dt-ma-down': '跌破 20MA（空方）', 'dt-open-low': '跌破開盤低點（空方）' };
+// 舊版訊號（紀錄與檢討仍可查看）：v2 多週期確認、v1 當日分 K
+const LEGACY_TITLES = { 2: { 'dt-breakout': '多週期爆量突破', 'dt-vwap': '多週期回測轉強', 'dt-bid': '五檔增強確認', 'dt-weak': '多單轉弱警示', 'dt-risk': '跌破參考停損', 'dt-stop': '停止新增部位' },
+  1: { 'dt-breakout': '爆量突破', 'dt-vwap': 'VWAP 趨勢延續', 'dt-bid': '買盤持續增強' } };
+export const signalTitle = s => DT_TITLES[s.type] || LEGACY_TITLES[s.version || 1]?.[s.type] || LEGACY_TITLES[2][s.type] || s.type;
 export const DT_PLANS = ['auto', 'basic', 'developer', 'advanced'];
-export const DT_SCOPES = ['all', 'watchlist'];
 export const DT_DEFAULTS = Object.freeze({
-  enabled: true, plan: 'auto', top: 20, minScore: 60,
-  displayMin: 80,                                // 掃描清單只顯示分數 ≥ 此值的股票（只影響畫面，不影響訊號）
-  scope: 'all',                                  // 掃描範圍：all＝全部研究族群＋自選（即時推播訂閱的股票）；watchlist＝只掃自選
-  signals: { breakout: true, vwap: true, bid: true, weak: true, risk: true },
-  bookWindowSeconds: 30, bookMaxAgeSeconds: 10, quoteMaxAgeSeconds: 15, bookImbalance: 0.3,
-  watchFrom: '09:15', stopNew: '13:10',          // 開盤觀察期結束、停止發出新訊號的時間
-  maxSpreadTicks: 3,                             // 委買賣價差超過幾檔不發訊號
-  minDailyAmount: 100e6,                         // 近 20 日平均成交金額下限（流動性）
-  breakoutLookback: 15, breakoutVolume: 2,       // 突破前 N 分鐘高點、完成 5 分量 ≥ 同時段均量倍數
+  version: DT_VERSION, enabled: true, plan: 'auto', top: 30,       // top：觀察名單畫面顯示幾檔（只影響畫面）
+  sources: { turnover: true, groups: true, watchlist: false },    // 觀察名單來源：前一日高周轉率、全部研究族群、自選股
+  turnoverTop: 50, turnoverMinAmount: 100e6,                      // 高周轉率：前一交易日周轉率前 N 名，且成交金額達下限
+  signals: { maUp: true, maDown: true, openLow: true },
+  eligibleOnly: true,                                             // 只對可現股當沖的股票發訊號（排除不可當沖、處置；空方另排除暫停先賣後買）
+  watchFrom: '09:05', stopNew: '13:25',                           // 訊號時段：第一根 5 分 K 走完起，到收盤集合競價前
   costs: { feeRate: 0.001425, feeDiscount: 1, taxRate: 0.0015, slipTicks: 1 }, // 手續費（買賣各一次）、當沖證交稅、滑價（每邊檔數）
 });
 const HM = /^([01]\d|2[0-3]):[0-5]\d$/;
-const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
 const round = (x, n = 2) => x == null || !Number.isFinite(x) ? null : Math.round(x * 10 ** n) / 10 ** n;
 
+// 舊版（v2 以前）的設定只沿用開關、方案與成本；訊號時段、訊號種類與名單來源改用新版預設
 export function normalizeDaytrade(input = {}) {
-  const d = DT_DEFAULTS, s = input || {}, c = s.costs || {}, num = (v, lo, hi, def) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : def; };
+  const d = DT_DEFAULTS, s = input || {}, c = s.costs || {}, v3 = s.version === DT_VERSION, num = (v, lo, hi, def) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : def; };
+  const flags = (def, src) => Object.fromEntries(Object.keys(def).map(k => [k, v3 && typeof src?.[k] === 'boolean' ? src[k] : def[k]]));
   return {
-    enabled: s.enabled !== false, plan: DT_PLANS.includes(s.plan) ? s.plan : d.plan, scope: DT_SCOPES.includes(s.scope) ? s.scope : d.scope,
-    top: Math.round(num(s.top, 5, 50, d.top)), minScore: Math.round(num(s.minScore, 0, 100, d.minScore)), displayMin: Math.round(num(s.displayMin, 0, 100, d.displayMin)),
-    signals: Object.fromEntries(Object.keys(d.signals).map(k => [k, s.signals?.[k] !== false])),
-    watchFrom: HM.test(s.watchFrom) ? s.watchFrom : d.watchFrom, stopNew: HM.test(s.stopNew) ? s.stopNew : d.stopNew,
-    maxSpreadTicks: Math.round(num(s.maxSpreadTicks, 1, 20, d.maxSpreadTicks)), minDailyAmount: num(s.minDailyAmount, 0, 1e11, d.minDailyAmount),
-    breakoutLookback: Math.round(num(s.breakoutLookback, 5, 60, d.breakoutLookback) / 5) * 5, breakoutVolume: num(s.breakoutVolume, 1, 10, d.breakoutVolume),
-    bookWindowSeconds: Math.round(num(s.bookWindowSeconds, 20, 60, d.bookWindowSeconds)), bookMaxAgeSeconds: Math.round(num(s.bookMaxAgeSeconds, 3, 15, d.bookMaxAgeSeconds)),
-    quoteMaxAgeSeconds: Math.round(num(s.quoteMaxAgeSeconds, 5, 30, d.quoteMaxAgeSeconds)), bookImbalance: num(s.bookImbalance, 0.2, 0.6, d.bookImbalance),
+    version: DT_VERSION, enabled: s.enabled !== false, plan: DT_PLANS.includes(s.plan) ? s.plan : d.plan,
+    top: Math.round(num(v3 ? s.top : null, 10, 200, d.top)),
+    sources: flags(d.sources, s.sources), turnoverTop: Math.round(num(s.turnoverTop, 10, 200, d.turnoverTop)), turnoverMinAmount: num(s.turnoverMinAmount, 0, 1e11, d.turnoverMinAmount),
+    signals: flags(d.signals, s.signals), eligibleOnly: s.eligibleOnly !== false,
+    watchFrom: v3 && HM.test(s.watchFrom) ? s.watchFrom : d.watchFrom, stopNew: v3 && HM.test(s.stopNew) ? s.stopNew : d.stopNew,
     costs: { feeRate: num(c.feeRate, 0, 0.01, d.costs.feeRate), feeDiscount: num(c.feeDiscount, 0.1, 1, d.costs.feeDiscount), taxRate: num(c.taxRate, 0, 0.01, d.costs.taxRate), slipTicks: Math.round(num(c.slipTicks, 0, 5, d.costs.slipTicks)) },
   };
 }
@@ -53,50 +50,40 @@ export function tzOffset(tz, at = Date.now()) {
   return Date.UTC(+o.year, +o.month - 1, +o.day, +o.hour, +o.minute, +o.second) - Math.floor(at / 1000) * 1000;
 }
 
-/* ---------- 同時段歷史量 ---------- */
-// 由時光機的每分鐘畫格（累計成交量）建立基準：每檔、每個「已交易分鐘數」的平均累計量。
-// 某檔有效天數不足 3 天時，用全市場的日內量能曲線 × 該檔近 20 日均量推估。days：[{ ids, frames:[{t, v}] }]
-export function buildBaseline(days, ids, p, { minDays = 3 } = {}) {
-  const want = new Set(ids), L = p.length, shapeSum = new Float64Array(L + 1), per = new Map();
-  let shapeDays = 0;
-  for (const day of days) {
-    const frames = (day?.frames || []).filter(f => Array.isArray(f.v)); // 早期的時光機紀錄沒有成交量，略過
-    if (!frames.length || !Array.isArray(day.ids)) continue;
-    const cover = new Set(frames.map(f => elapsedTrading(p, minuteOf(f.t) + 1))).size;
-    if (cover < L * 0.6) continue; // 只記錄到部分時段的日子不納入
-    const idx = day.ids.map((id, i) => [id, i]), cum = new Map(), total = new Float64Array(L + 1);
-    for (const f of frames) {
-      const e = elapsedTrading(p, minuteOf(f.t) + 1); if (e < 1) continue;
-      let sum = 0;
-      for (const [id, i] of idx) { const v = f.v[i] || 0; sum += v; if (want.has(id)) { let a = cum.get(id); if (!a) cum.set(id, a = new Float64Array(L + 1)); a[e] = Math.max(a[e], v); } }
-      total[e] = Math.max(total[e], sum);
-    }
-    fill(total);
-    if (total[L] > 0) { for (let e = 0; e <= L; e++) shapeSum[e] += total[e] / total[L]; shapeDays++; }
-    for (const [id, a] of cum) { fill(a); if (!(a[L] > 0)) continue; let s = per.get(id); if (!s) per.set(id, s = { n: 0, sum: new Float64Array(L + 1) }); s.n++; for (let e = 0; e <= L; e++) s.sum[e] += a[e]; }
+/* ---------- 觀察名單：前一日高周轉率 ---------- */
+// 周轉率＝成交股數 ÷ 股數（集保總股數，約等於發行股數）。只算普通股（4 碼、非 0 開頭，排除 ETF），依周轉率由高到低排序。
+// volumes：{ 代號: 成交股數 }；amounts：{ 代號: 成交金額 }；shares：{ 代號: 股數 }；allow：可納入的代號（null＝不限）
+export function rankTurnover({ volumes = {}, amounts = {}, shares = {}, allow = null, limit = 500 } = {}) {
+  const out = [];
+  for (const [id, vol] of Object.entries(volumes)) {
+    const sh = shares[id];
+    if (!/^[1-9]\d{3}$/.test(id) || !(vol > 0) || !(sh > 0) || (allow && !allow.has(id))) continue;
+    out.push({ id, rate: round(vol / sh * 100, 2), amount: amounts[id] ?? null });
   }
-  const shape = shapeDays ? shapeSum.map(x => x / shapeDays) : null, stock = new Map();
-  for (const [id, s] of per) if (s.n >= minDays) stock.set(id, s.sum.map(x => x / s.n));
-  return { days: shapeDays, shape, stock };
+  return out.sort((a, b) => b.rate - a.rate || a.id.localeCompare(b.id)).slice(0, limit);
 }
-// 補齊沒有畫格的分鐘（沿用前一分鐘的累計量）
-function fill(a) { for (let e = 1; e < a.length; e++) if (!(a[e] > 0)) a[e] = a[e - 1]; }
+// 從排行取觀察名單：成交金額達下限、不在排除名單（不可當沖、處置、暫停交易）的前 N 名
+export function selectTurnover(ranked, { top = DT_DEFAULTS.turnoverTop, minAmount = DT_DEFAULTS.turnoverMinAmount, exclude = new Set() } = {}) {
+  return (ranked || []).filter(x => !exclude.has(x.id) && !(minAmount > 0 && !(x.amount >= minAmount))).slice(0, top);
+}
 
 /* ---------- 盤中引擎 ---------- */
-// meta：Map(id → { name, groups:[族群 id], exchange:'上市'／'上櫃' })；prep：{ eligible:Set|null, disposition:Set, suspended:Set, sellFirstOff:Set, ref:Map(id → 參考價), avgAmount:Map, avgVolume:Map }
-// watch：自選（標示用）；scan：掃描與發訊號的股票（未提供時同 watch）
-export function createDayTrade({ market: p, date, ids, meta = new Map(), watch = new Set(), scan = null, baseline = null, prep = {}, settings = DT_DEFAULTS, offset = 8 * 3600e3, lang }) {
-  const S = new Map(), log = [], lot = p.lot || 1000, T = (msg, params) => t(msg, params, lang), unit = p.unit?.[lang || 'zh-TW'] || T('股');
-  let cfg = normalizeDaytrade(settings), info = { eligible: null, disposition: new Set(), suspended: new Set(), sellFirstOff: new Set(), ref: new Map(), avgAmount: new Map(), avgVolume: new Map(), ...prep };
-  let gaps = new Set(), feedOk = false, fullFeed = false, stopNotified = false;
+const GRACE = 3000; // 5 分 K 走完後等 3 秒再判斷，讓最後幾筆成交與 1 分 K 先到
+// meta：Map(id → { name, groups:[族群 id], exchange:'上市'／'上櫃', turnover:前一日周轉率（%，高周轉率名單才有） })
+// prep：{ eligible:Set|null, disposition:Set, suspended:Set, sellFirstOff:Set, ref:Map(id → 參考價) }
+// watch：自選（標示用）；scan：觀察名單，只對這些股票判斷與發訊號（未提供時同 watch）
+export function createDayTrade({ market: p, date, ids, meta = new Map(), watch = new Set(), scan = null, prep = {}, settings = DT_DEFAULTS, offset = 8 * 3600e3, lang }) {
+  const S = new Map(), log = [], lot = p.lot || 1000, T = (msg, params) => t(msg, params, lang);
+  let cfg = normalizeDaytrade(settings), info = { eligible: null, disposition: new Set(), suspended: new Set(), sellFirstOff: new Set(), ref: new Map(), ...prep };
+  let gaps = new Set(), feedOk = false;
   const history = new Map();
-  // 大盤環境（只記錄）：上市對照加權、上櫃對照櫃買；server.mjs 餵入指數資料，訊號紀錄附上當下狀態，不影響分數與訊號
+  // 大盤環境（只記錄）：上市對照加權、上櫃對照櫃買；server.mjs 餵入指數資料，訊號紀錄附上當下狀態，不影響訊號
   const market = createMarketTracker({ date, open: p.open, offset });
+  const midnight = Date.parse(`${date}T00:00:00Z`) - offset;
   const modOf = ms => Math.floor((ms + offset) / 60000) % 1440;
   const hmsOf = ms => { const s = Math.floor((ms + offset) / 1000) % 86400; return `${hhmm(Math.floor(s / 60))}:${String(s % 60).padStart(2, '0')}`; };
-  const eOf = m => elapsedTrading(p, m + 1); // 分鐘 m 結束時已交易的分鐘數
   for (const id of ids) S.set(id, blank(id));
-  function blank(id) { return { id, ref: null, last: null, lastAt: 0, quoteAt: 0, open: null, high: null, low: null, cumVol: 0, cumAmt: 0, vNum: 0, vDen: 0, atAsk: 0, atBid: 0, serial: -1, bars: new Map(), book: null, bookAt: 0, obi: [], books: [], gates: new Map(), reference: null, fired: new Map(), limitUp: false, halted: false, tape: [] }; }
+  function blank(id) { return { id, ref: null, last: null, lastAt: 0, quoteAt: 0, open: null, high: null, low: null, cumVol: 0, cumAmt: 0, vNum: 0, vDen: 0, atAsk: 0, atBid: 0, serial: -1, bars: new Map(), book: null, bookAt: 0, five: null, fiveAt: 0, detected: 0, fired: new Map(), limitUp: false, halted: false, tape: [] }; }
   const st = id => { let s = S.get(id); if (!s) S.set(id, s = blank(id)); return s; };
   const refOf = s => s.ref ?? info.ref.get(s.id) ?? null;
   const barOf = (s, m) => { let b = s.bars.get(m); if (!b) s.bars.set(m, b = { m, o: null, h: -Infinity, l: Infinity, c: null, tv: 0, cv: 0, ask: 0, bid: 0, lastAt: 0 }); return b; };
@@ -120,12 +107,9 @@ export function createDayTrade({ market: p, date, ids, meta = new Map(), watch =
         if (side > 0) { s.atAsk += size; b.ask += size; } else if (side < 0) { s.atBid += size; b.bid += size; }
         s.tape.push([ev.time, px, size, side]); if (s.tape.length > 80) s.tape.splice(0, s.tape.length - 60); // 最近成交明細（看板個股走勢用）
         s.limitUp = !!ev.limitUp; s.halted = !!ev.halted;
-      } else if (ev.kind === 'book') {
+      } else if (ev.kind === 'book') { // 五檔只供看板與個股走勢顯示，不參與訊號
         if (ev.time <= s.bookAt) continue;
-        appendBook(s.books, ev);
         s.book = { bids: ev.bids || [], asks: ev.asks || [] }; s.bookAt = ev.time || s.lastAt;
-        const B = s.book.bids.reduce((x, l) => x + (l.size || 0), 0), A = s.book.asks.reduce((x, l) => x + (l.size || 0), 0);
-        if (B + A > 0) { s.obi.push([s.bookAt, (B - A) / (B + A)]); while (s.obi.length && s.obi[0][0] < s.bookAt - 60e3) s.obi.shift(); }
       } else if (ev.kind === 'candle') {
         const b = barOf(s, modOf(ev.time)); b.cv = Math.max(b.cv, ev.volume || 0);
         if (ev.open > 0 && b.o == null) b.o = ev.open; if (ev.high > 0) b.h = Math.max(b.h, ev.high); if (ev.low > 0) b.l = Math.min(b.l, ev.low);
@@ -155,21 +139,18 @@ export function createDayTrade({ market: p, date, ids, meta = new Map(), watch =
     const quoteTime = usTime(quote.closeTime ?? quote.lastTrade?.time);
     const validCandles = candles.filter(c => Number.isFinite(Date.parse(c.date)) && contextDate(Date.parse(c.date)) === date && validBar({ o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume }));
     if (!Number.isFinite(quoteTime) || !quoteTime || contextDate(quoteTime) !== date || !validCandles.length) return false;
-    const s = st(id), q = quote;
-    if (q) {
-      const t = q.total || {}, at = quoteTime;
-      if (q.referencePrice > 0) s.ref = q.referencePrice;
-      if (t.tradeVolume >= s.cumVol) { s.cumVol = t.tradeVolume; s.cumAmt = t.tradeValue ?? s.cumAmt; s.atAsk = t.tradeVolumeAtAsk ?? s.atAsk; s.atBid = t.tradeVolumeAtBid ?? s.atBid; }
-      // 均價一律以報價的全日均價重設：推播的累計量可能比 REST 報價稍新，若沿用上面的條件，VWAP 只會剩下重連後的成交
-      if (q.avgPrice > 0 && t.tradeVolume > 0) { s.vNum = q.avgPrice * t.tradeVolume; s.vDen = t.tradeVolume; }
-      if (q.openPrice > 0) s.open = q.openPrice; if (q.highPrice > 0) s.high = q.highPrice; if (q.lowPrice > 0) s.low = q.lowPrice;
-      if (q.closePrice > 0 && at >= s.lastAt) { s.last = q.closePrice; s.lastAt = at; s.quoteAt = at; }
-      if (q.lastTrade?.serial > s.serial) s.serial = q.lastTrade.serial;
-      s.halted = !!q.tradingHalt?.isHalted; s.limitUp = !!q.isLimitUpPrice;
-      if (q.bids || q.asks) ingest([{ kind: 'book', id, time: usTime(q.lastUpdated ?? t.time), bids: q.bids, asks: q.asks }]);
-    }
+    const s = st(id), q = quote, tot = q.total || {}, at = quoteTime;
+    if (q.referencePrice > 0) s.ref = q.referencePrice;
+    if (tot.tradeVolume >= s.cumVol) { s.cumVol = tot.tradeVolume; s.cumAmt = tot.tradeValue ?? s.cumAmt; s.atAsk = tot.tradeVolumeAtAsk ?? s.atAsk; s.atBid = tot.tradeVolumeAtBid ?? s.atBid; }
+    // 均價一律以報價的全日均價重設：推播的累計量可能比 REST 報價稍新，若沿用上面的條件，VWAP 只會剩下重連後的成交
+    if (q.avgPrice > 0 && tot.tradeVolume > 0) { s.vNum = q.avgPrice * tot.tradeVolume; s.vDen = tot.tradeVolume; }
+    if (q.openPrice > 0) s.open = q.openPrice; if (q.highPrice > 0) s.high = q.highPrice; if (q.lowPrice > 0) s.low = q.lowPrice;
+    if (q.closePrice > 0 && at >= s.lastAt) { s.last = q.closePrice; s.lastAt = at; s.quoteAt = at; }
+    if (q.lastTrade?.serial > s.serial) s.serial = q.lastTrade.serial;
+    s.halted = !!q.tradingHalt?.isHalted; s.limitUp = !!q.isLimitUpPrice;
+    if (q.bids || q.asks) ingest([{ kind: 'book', id, time: usTime(q.lastUpdated ?? tot.time), bids: q.bids, asks: q.asks }]);
     for (const c of validCandles) ingest([{ kind: 'candle', id, time: Date.parse(c.date), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume }]);
-    gaps.delete(id); return true;
+    gaps.delete(id); dirty(s); return true;
   }
 
   // 每檔的即時快照列（與資料源快照格式相同，供異動雷達與即時看板使用）
@@ -180,129 +161,113 @@ export function createDayTrade({ market: p, date, ids, meta = new Map(), watch =
       total_volume: s.cumVol, total_amount: s.cumAmt, yesterday_volume: null, buy_price: bid ?? null, sell_price: ask ?? null, volume_at_bid: s.atBid, volume_at_ask: s.atAsk };
   }
 
-  /* 指標 */
-  const base = (id, e) => { if (e <= 0) return 0; const a = baseline?.stock?.get(id); if (a) return a[Math.min(e, a.length - 1)]; const v = info.avgVolume.get(id), sh = baseline?.shape; return v > 0 && sh ? v * sh[Math.min(e, sh.length - 1)] : null; };
+  /* 5 分 K 狀態 */
   const vwapOf = s => s.vDen > 0 ? s.vNum / s.vDen : s.cumVol > 0 ? s.cumAmt / (s.cumVol * lot) : null;
-  function metrics(s, cur, now) {
-    const ref = refOf(s), last = s.last, done = [...s.bars.values()].filter(b => b.m < cur && b.c != null).sort((a, b) => a.m - b.m);
-    const winVol = k => { let v = 0; for (const b of done) if (b.m > cur - 1 - k) v += vol(b); return v; };
-    const eNow = eOf(cur - 1), ratio = k => { const b0 = base(s.id, eNow), b1 = base(s.id, eNow - k); return b0 != null && b1 != null && b0 - b1 > 0 ? winVol(k) / (b0 - b1) : null; };
-    const r1 = ratio(1), r3 = ratio(3), r5 = ratio(5), bCum = base(s.id, eNow), rvol = bCum > 0 ? sumVol(done) / bCum : null;
-    const vwap = vwapOf(s), closes = done.map(b => b.c), ema = n => closes.reduce((e, c, i) => i ? e + (c - e) * 2 / (n + 1) : c, null);
-    const look = done.filter(b => b.m >= cur - 1 - cfg.breakoutLookback && b.m < cur - 1), hi = look.length ? Math.max(...look.map(b => b.h)) : null;
-    const last5 = done.filter(b => b.m > cur - 6), ask5 = last5.reduce((x, b) => x + b.ask, 0), bid5 = last5.reduce((x, b) => x + b.bid, 0);
-    const ob = s.obi.filter(o => o[0] >= now - 30e3 && o[0] <= now), obiAvg = ob.length ? ob.reduce((x, o) => x + o[1], 0) / ob.length : null, obiMin = ob.length ? Math.min(...ob.map(o => o[1])) : null;
-    const b1 = s.book?.bids?.[0]?.price, a1 = s.book?.asks?.[0]?.price, tick = last > 0 ? tickSize(p, last) : null;
-    const spread = b1 > 0 && a1 > 0 && tick ? Math.round((a1 - b1) / tick) : null, bookStale = !s.book || now - s.bookAt > cfg.bookMaxAgeSeconds * 1000;
-    const midnight = Date.parse(`${date}T00:00:00+08:00`);
-    const live = done.map(b => ({ time: midnight + b.m * 60000, o: b.o, h: b.h, l: b.l, c: b.c, v: vol(b) }));
-    const context = analyzeContext(history.get(s.id), live, s.books, { date, now, last, lastAt: s.quoteAt, ref, tick, vwap, settings: cfg, full: fullFeed });
-    if (context.risk > 0) { const low = context.risk + tick; context.risk = round(low - tickSize(p, low - 1e-7), 4); }
-    if (!info.eligible) { context.ready = false; context.reasons.push('eligibility'); context.conditions = { breakout: false, vwap: false, bid: false, weak: false }; }
-    return { ref, last, change: ref > 0 && last > 0 ? (last / ref - 1) * 100 : null, gap: ref > 0 && s.open > 0 ? (s.open / ref - 1) * 100 : null, vwap, r1, r3, r5, rvol, hi, done, ema5: ema(5), ema20: ema(20),
-      outer5: ask5 + bid5 > 0 ? ask5 / (ask5 + bid5) : null, obi: context.book.obi ?? obiAvg, obiMin, spread, bookStale, tick, context };
+  const dirty = s => { s.fiveAt = 0; s.detected = 0; }; // 歷史或補資料到了：重新計算，尚未發過的訊號可補發
+  // 最近一個已走完的 5 分鐘界線（毫秒）：09:05、09:10 … 13:25、13:30；開盤後未滿 5 分鐘時為 0
+  function boundaryOf(now) {
+    const m = modOf(now - GRACE), el = Math.min(m, p.close) - p.open; if (el < 5) return 0;
+    return midnight + (p.open + Math.floor(el / 5) * 5) * 60000;
   }
-  const sumVol = bars => bars.reduce((x, b) => x + vol(b), 0);
-  // 個股近 15 分鐘漲跌（%）：現價對 15 分鐘前最後一根完成 1 分 K 的收盤
-  const recentChange = (m, cur) => { const b = m.done.filter(x => x.m <= cur - MARKET_RULES.window).at(-1); return b?.c > 0 && m.last > 0 ? (m.last / b.c - 1) * 100 : null; };
-
-  // 排除條件：不可當沖、處置、暫停交易、價差過大、流動性不足、已漲停（買不到）
-  function filters(s, m) {
+  // 今天已完成的 1 分 K（引擎的分 K 以「當日第幾分鐘」為鍵）→ 5 分 K
+  const liveMinutes = s => [...s.bars.values()].filter(b => b.c != null && b.o != null).map(b => ({ time: midnight + b.m * 60000, o: b.o, h: b.h, l: b.l, c: b.c, v: vol(b) }));
+  // 歷史 5 分 K 換算到今天的價格口徑：今天的參考價與前一日收盤相差超過 1.5 檔（除權息、減資等）時，歷史價格乘上比例
+  function historyBars(s, tick) {
+    const h = history.get(s.id); if (!h?.five.length) return [];
+    const ref = refOf(s), f = ref > 0 && h.rawClose > 0 && tick > 0 && Math.abs(ref - h.rawClose) > tick * 1.5 ? ref / h.rawClose : 1;
+    return f === 1 ? h.five : h.five.map(b => ({ ...b, o: b.o * f, h: b.h * f, l: b.l * f, c: b.c * f }));
+  }
+  function refresh(s, boundary) {
+    if (s.fiveAt === boundary && s.five) return s.five;
+    const tick = s.last > 0 ? tickSize(p, s.last) : null, today = boundary ? fiveMinuteBars(liveMinutes(s), boundary) : [];
+    const ma = maState([...historyBars(s, tick), ...today]), ol = openLowState(today), b = today.at(-1);
+    s.fiveAt = boundary;
+    return s.five = { end: b?.end ?? null, current: !!b && b.end === boundary, close: b?.c ?? null, bars: ma.count, today: today.length,
+      ma20: today.length ? round(ma.ma, 4) : null, prevClose: ma.prevClose, prevMa20: round(ma.prevMa, 4), above: today.length ? ma.above : null, below: today.length ? ma.below : null,
+      crossUp: !!b && ma.crossUp, crossDown: !!b && ma.crossDown, openLow: ol.low, belowOpen: ol.below, brokeOpen: ol.broke };
+  }
+  // 排除條件（只在資料取得時生效）：暫停交易；勾選「只對可當沖股票」時另排除不可現股當沖、處置股
+  function filters(s) {
     const out = [];
-    if (info.eligible && !info.eligible.has(s.id)) out.push('noDayTrade');
-    if (info.disposition.has(s.id)) out.push('disposition');
     if (info.suspended.has(s.id) || s.halted) out.push('suspended');
-    if (m.spread != null && m.spread > cfg.maxSpreadTicks) out.push('spread');
-    const amt = info.avgAmount.get(s.id); if (amt != null && amt < cfg.minDailyAmount) out.push('liquidity');
-    const lim = m.ref > 0 ? limitPrices(p, m.ref) : null; if (s.limitUp || (lim && m.last >= lim.up)) out.push('limitUp');
+    if (cfg.eligibleOnly && info.eligible && !info.eligible.has(s.id)) out.push('noDayTrade');
+    if (cfg.eligibleOnly && info.disposition.has(s.id)) out.push('disposition');
     return out;
-  }
-  // 當沖機會分數（0–100）：各部分的得分與最高分
-  function score(s, m) {
-    const c = m.context, part = {
-      daily: c.daily.long ? 20 : 0,
-      hour: c.hour.long ? 25 : 0,
-      five: c.five.current ? (m.last > m.vwap ? 10 : 0) + (c.five.close > c.five.resistance ? 10 : 0) + 10 * clamp(((c.five.volumeRatio || 0) - 1) / (cfg.breakoutVolume - 1 || 1)) : 0,
-      book: c.book.ready ? (c.book.long ? 25 : 15 * clamp((c.book.obi || 0) / cfg.bookImbalance)) : 0,
-    };
-    for (const key in part) part[key] = round(part[key], 1);
-    return { total: round(Object.values(part).reduce((a, b) => a + b, 0), 1), part };
   }
   // 交易階段：盤前、開盤觀察、掃描、停止新訊號、收盤集合競價、收盤
   function phase(cur) {
     const w = minuteOf(cfg.watchFrom), stop = minuteOf(cfg.stopNew), auction = p.close - (p.id === 'TW' ? 5 : 0);
     return cur < p.open ? 'pre' : cur < w ? 'opening' : cur < Math.min(stop, auction) ? 'scan' : cur < auction ? 'stop' : cur < p.close + p.settle ? 'auction' : 'closed';
   }
+  // 個股近 15 分鐘漲跌（%）：現價對 15 分鐘前最後一根完成 1 分 K 的收盤（大盤環境紀錄用）
+  const recentChange = (s, cur) => { const b = [...s.bars.values()].filter(x => x.c != null && x.m <= cur - MARKET_RULES.window).sort((a, b) => a.m - b.m).at(-1); return b?.c > 0 && s.last > 0 ? (s.last / b.c - 1) * 100 : null; };
 
   let lastEval = { at: 0, list: [], counts: {} };
-  // 每秒呼叫：計算全部股票的分數與排名，偵測訊號；回傳新訊號（雷達事件格式）
+  // 每秒呼叫：更新觀察名單每檔的 5 分 K 狀態，5 分 K 走完時判斷訊號；回傳新訊號（雷達事件格式）
   function tick(now) {
     if (contextDate(now) !== date) return [];
-    const cur = modOf(now), ph = phase(cur), alerts = [], list = [];
-    const all = [...S.values()].filter(s => s.last > 0), ms = new Map(all.map(s => [s.id, metrics(s, cur, now)]));
-    const chg = [...ms.values()].map(m => m.change).filter(x => x != null), marketChg = chg.length ? chg.reduce((a, b) => a + b, 0) / chg.length : null;
-    const groupChg = new Map();
-    for (const s of all) for (const g of meta.get(s.id)?.groups || []) { const c = ms.get(s.id).change; if (c == null) continue; const x = groupChg.get(g) || [0, 0]; x[0] += c; x[1]++; groupChg.set(g, x); }
-    const counts = {};
+    const cur = modOf(now), ph = phase(cur), boundary = boundaryOf(now), alerts = [], list = [], counts = { long: 0, short: 0, waiting: 0 }, excluded = {};
+    const all = [...S.values()].filter(s => s.last > 0), inScan = scan || watch;
+    const chg = all.map(s => { const ref = refOf(s); return ref > 0 ? (s.last / ref - 1) * 100 : null; }).filter(x => x != null), marketChg = chg.length ? chg.reduce((a, b) => a + b, 0) / chg.length : null;
     for (const s of all) {
-      const m = ms.get(s.id), gs = (meta.get(s.id)?.groups || []).map(g => groupChg.get(g)).filter(x => x?.[1] > 1), gc = gs.length ? Math.max(...gs.map(([a, n]) => a / n)) : null;
-      const sc = score(s, m, gc, marketChg), why = filters(s, m);
-      for (const f of why) counts[f] = (counts[f] || 0) + 1;
-      const item = { id: s.id, name: meta.get(s.id)?.name || s.id, watch: watch.has(s.id), scan: (scan || watch).has(s.id), price: m.last, change: round(m.change), gap: round(m.gap), vwap: round(m.vwap, 2), vwapDist: m.vwap > 0 ? round((m.last / m.vwap - 1) * 100) : null,
-        rvol: round(m.rvol), r1: round(m.r1), outer5: m.outer5 == null ? null : round(m.outer5 * 100, 0), obi: round(m.obi), spread: m.spread, score: sc.total, part: sc.part, filters: why, pending: gaps.has(s.id), context: m.context, reference: s.reference, last: s.lastSignal || null, at: hmsOf(s.lastAt) };
+      const scanned = inScan.has(s.id), mt = meta.get(s.id), ref = refOf(s), change = ref > 0 ? (s.last / ref - 1) * 100 : null, vwap = vwapOf(s);
+      const f = scanned ? refresh(s, boundary) : null, why = scanned ? filters(s) : [];
+      const reasons = !f ? [] : [...(f.today ? [] : ['fiveMinute']), ...(f.bars < MA_PERIOD + 1 ? ['history'] : [])];
+      if (scanned) { for (const k of why) excluded[k] = (excluded[k] || 0) + 1; if (reasons.length || f.above == null) counts.waiting++; else if (f.above) counts.long++; else if (f.below) counts.short++; }
+      const item = { id: s.id, name: mt?.name || s.id, watch: watch.has(s.id), scan: scanned, turnover: mt?.turnover ?? null, grouped: !!mt?.groups?.length, price: s.last, change: round(change), vwap: round(vwap, 2),
+        five: f && { end: f.end ? hmsOf(f.end).slice(0, 5) : null, close: f.close, ma20: round(f.ma20), dist: f.ma20 > 0 ? round((s.last / f.ma20 - 1) * 100) : null, above: f.above, bars: f.bars, openLow: f.openLow, belowOpen: f.openLow > 0 ? s.last < f.openLow : null },
+        filters: why, pending: gaps.has(s.id), reasons, last: s.lastSignal || null, at: hmsOf(s.lastAt) };
       list.push(item);
-      // Risk alerts continue after the entry cutoff, and never depend on a high long score.
-      if (!cfg.enabled || !item.scan || !['scan', 'stop'].includes(ph) || !feedOk || gaps.has(s.id) || !m.context.quoteFresh || why.includes('suspended')) continue;
-      for (const a of detect(s, m, cur, sc, now, ph === 'scan' && !why.length && sc.total >= cfg.minScore)) { if (!a.muted) alerts.push({ ...a, stockId: s.id, name: item.name, close: m.last, change: item.change, t: hmsOf(now), watch: item.watch, level: 'hi', score: sc.total });
-        s.lastSignal = { type: a.type, t: hmsOf(now) }; log.push({ ...a, version: 2, id: s.id, name: item.name, at: now, m: cur, t: hmsOf(now), price: m.last, vwap: round(m.vwap, 2), score: sc.total, part: sc.part, evidence: m.context, market: marketRecord(market, meta.get(s.id)?.exchange, { chg: m.change, r15: recentChange(m, cur) }, now) }); }
+      // 一根 5 分 K 只判斷一次；連線異常或補資料中先不判斷，恢復後若這根仍是最新一根再補判
+      if (!cfg.enabled || !scanned || ph !== 'scan' || !feedOk || gaps.has(s.id) || !f.current || s.detected === f.end) continue;
+      s.detected = f.end;
+      for (const a of detect(s, f, why)) {
+        s.fired.set(a.type, f.end); s.lastSignal = { type: a.type, side: a.side, t: hmsOf(now) };
+        alerts.push({ ...a, stockId: s.id, name: item.name, close: s.last, change: item.change, t: hmsOf(now), watch: item.watch, level: 'hi' });
+        log.push({ ...a, version: DT_VERSION, id: s.id, name: item.name, at: now, m: cur, t: hmsOf(now), price: s.last, vwap: item.vwap, turnover: item.turnover,
+          bar: { end: f.end, close: f.close, ma20: f.ma20, prevClose: f.prevClose, prevMa20: f.prevMa20, openLow: f.openLow },
+          market: marketRecord(market, mt?.exchange, { chg: change, r15: recentChange(s, cur) }, now) });
+      }
+      item.last = s.lastSignal || null;
     }
-    if (cfg.enabled && ph === 'stop' && !stopNotified && Object.values(cfg.signals).some(Boolean)) { stopNotified = true; alerts.push({ type: 'dt-stop', stockId: '', name: '', detail: T('{time} 起停止做多機會提醒；轉弱與參考停損仍監控至 13:25', { time: cfg.stopNew }), t: hmsOf(now), level: 'hi', watch: true }); }
-    list.sort((a, b) => (a.filters.length ? 1 : 0) - (b.filters.length ? 1 : 0) || b.score - a.score);
-    lastEval = { at: now, phase: ph, list, counts, marketChange: round(marketChg) };
+    // 排序：今天有訊號的在前（最新的最前），其餘依現價與 20MA 的距離由近到遠
+    const rank = x => x.last ? 0 : x.five?.dist == null ? 2 : 1;
+    list.sort((a, b) => rank(a) - rank(b) || (a.last && b.last ? b.last.t.localeCompare(a.last.t) : 0) || Math.abs(a.five?.dist ?? 0) - Math.abs(b.five?.dist ?? 0) || a.id.localeCompare(b.id));
+    lastEval = { at: now, phase: ph, list, counts, excluded, marketChange: round(marketChg) };
     return alerts.map(a => ({ title: T(DT_TITLES[a.type]), ...a }));
   }
-  // 做多機會與風險提醒分流；同類條件先解除再重新成立，才可重新提醒。
-  function detect(s, m, cur, sc, now, allowEntry) {
-    const c = m.context, out = [], end = c.five.end;
-    if (s.reference && m.last <= s.reference.stop) {
-      out.push({ type: DT_TYPES.risk, purpose: 'risk', muted: !cfg.signals.risk, reference: s.reference, detail: T('現價 {price} 跌破參考停損 {stop}；此為先前訊號失效提醒，非持倉確認', { price: m.last, stop: s.reference.stop }) });
-      s.reference = null;
-    }
-    if (!c.ready) return out;
-    for (const key of ['breakout', 'vwap', 'bid', 'weak']) {
-      const type = DT_TYPES[key], condition = c.conditions[key], gate = s.gates.get(type);
-      if (!condition) { if (gate && end > gate.end) gate.armed = true; continue; }
-      if (!cfg.signals[key] || (gate && (!gate.armed || end <= gate.end || now - gate.at < 10 * 60000))) continue;
-      if (key !== 'weak' && (!allowEntry || out.length || s.reference)) continue;
-      s.gates.set(type, { armed: false, end, at: now }); s.fired.set(type, cur);
-      const purpose = key === 'weak' ? 'risk' : 'opportunity';
-      if (purpose === 'opportunity') s.reference = { stop: c.risk, price: m.last, at: now, type };
-      out.push({ type, purpose, reference: s.reference,
-        detail: purpose === 'risk' ? T('5 分 K 跌破支撐 {support} 與 VWAP {vwap}；五檔轉弱 {obi}，請檢查多單風險', { support: round(c.five.support), vwap: round(m.vwap), obi: round(c.book.obi) })
-          : T('30 日日 K 與 60 分 K 偏多；5 分量 {ratio} 倍；五檔 OBI {obi}、變化 {delta}；參考停損 {stop}', { ratio: round(c.five.volumeRatio), obi: round(c.book.obi), delta: round(c.book.delta), stop: c.risk }) });
-    }
+  // 突破 20MA（多方）、跌破 20MA（空方）、跌破開盤低點（空方）。同一根 5 分 K 同一種訊號只發一次；
+  // 價格收回均線（或開盤低點）之上後再次跌破，才會再發一次。漲停不發多方、跌停不發空方（買不到／賣不到）。
+  function detect(s, f, why) {
+    if (why.length) return [];
+    const out = [], ref = refOf(s), lim = ref > 0 ? limitPrices(p, ref) : null, n = v => round(v, 2);
+    const add = (key, detail) => { const type = DT_TYPES[key]; if (cfg.signals[key] && s.fired.get(type) !== f.end) out.push({ type, side: DT_SIDES[type], detail }); };
+    const canLong = !(s.limitUp || (lim && s.last >= lim.up)), canShort = !(lim && s.last <= lim.down) && !(cfg.eligibleOnly && info.sellFirstOff.has(s.id));
+    if (f.crossUp && canLong) add('maUp', T('5 分 K 收 {close}，站上 20MA {ma}（前一根收 {prev}，在均線 {prevMa} 之下）', { close: n(f.close), ma: n(f.ma20), prev: n(f.prevClose), prevMa: n(f.prevMa20) }));
+    if (f.crossDown && canShort) add('maDown', T('5 分 K 收 {close}，跌破 20MA {ma}（前一根收 {prev}，在均線 {prevMa} 之上）', { close: n(f.close), ma: n(f.ma20), prev: n(f.prevClose), prevMa: n(f.prevMa20) }));
+    if (f.brokeOpen && canShort) add('openLow', T('5 分 K 收 {close}，跌破開盤低點 {low}', { close: n(f.close), low: n(f.openLow) }));
     return out;
   }
 
   return {
     ingest, backfill, row, tick, date,
-    setHistory(id, data) { const h = prepareContext(data, date); history.set(id, h); if (h.daily.length === 30) { const rows = h.daily.slice(-20); info.avgVolume.set(id, rows.reduce((n,b)=>n+b.v,0)/20); if (rows.every(b=>Number.isFinite(b.amount))) info.avgAmount.set(id, rows.reduce((n,b)=>n+b.amount,0)/20); } },
-    historyReady: id => !!history.get(id)?.complete,
-    setMode(mode) { fullFeed = mode === 'full'; },
+    // 歷史 5 分 K（今天以前）；資料源的 1 分 K 或已整理好的快取都可以
+    setHistory(id, data) { history.set(id, prepareHistory(data, date)); const s = S.get(id); if (s) dirty(s); },
+    historyReady: id => (history.get(id)?.five.length || 0) >= MA_PERIOD,
     syncIds(ids) { const want = new Set(ids); for (const id of S.keys()) if (!want.has(id)) { S.delete(id); history.delete(id); gaps.delete(id); } for (const id of want) st(id); },
-    // 服務重新啟動：還原今天已發出的訊號（供收盤檢討）與冷卻時間
-    restore(signals) { for (const x of signals || []) { if (!S.has(x.id)) continue; log.push(x); const s = st(x.id); s.fired.set(x.type, x.m); s.lastSignal = { type: x.type, t: x.t }; s.gates.set(x.type, { armed: false, end: x.evidence?.five?.end || x.at || 0, at: x.at || 0 }); if (x.version === 2 && x.purpose === 'opportunity') s.reference = x.reference; if (x.type === DT_TYPES.risk) s.reference = null; } },
+    // 服務重新啟動：還原今天已發出的訊號（供收盤檢討），同一根 5 分 K 不重複發
+    restore(signals) { for (const x of signals || []) { log.push(x); const s = st(x.id); if (x.bar?.end) s.fired.set(x.type, x.bar.end); s.lastSignal = { type: x.type, side: x.side, t: x.t }; } },
     ranking: () => lastEval,
     get signals() { return log; },
     bars: id => S.get(id)?.bars || new Map(),
     // 個股即時走勢：參考價、最新價、五檔、最近成交（看板個股走勢；每分鐘量價與均價由 bars 計算）
     quote(id) { const s = S.get(id); if (!s) return null; return { ref: refOf(s), last: s.last, lastAt: s.lastAt, open: s.open, high: s.high, low: s.low, cumVol: s.cumVol, cumAmt: s.cumAmt, vwap: vwapOf(s), atAsk: s.atAsk, atBid: s.atBid, book: s.book, bookAt: s.bookAt, tape: s.tape.slice(-40), limitUp: s.limitUp }; },
-    setPrep(next) { const av = new Map([...info.avgVolume, ...(next.avgVolume || [])]), aa = new Map([...info.avgAmount, ...(next.avgAmount || [])]); info = { ...info, ...next, avgVolume: av, avgAmount: aa }; },
+    setPrep(next) { info = { ...info, ...next }; for (const s of S.values()) dirty(s); },
     setSettings(next) { cfg = normalizeDaytrade(next); },
     setWatch(next) { watch = next; },
     setScan(next) { scan = next; },
     // 斷線：這些股票在補完資料前不發訊號；feed：連線是否正常
-    markGap(list) { for (const id of list) { gaps.add(id); const s = S.get(id); if (s) { s.books = []; s.obi = []; } } },
+    markGap(list) { for (const id of list) gaps.add(id); },
     setFeed(ok) { feedOk = !!ok; },
     get gaps() { return gaps; },
     get ids() { return [...S.keys()]; },
@@ -316,34 +281,37 @@ export function createDayTrade({ market: p, date, ids, meta = new Map(), watch =
 const usTime = v => { const n = Number(v); return n > 1e14 ? n / 1000 : n > 1e11 ? n : n > 0 ? n * 1000 : 0; };
 
 /* ---------- 收盤後檢討 ---------- */
-// 每個訊號：以訊號價加滑價買進，於 5／15／30 分鐘後與收盤時以收盤價減滑價賣出，扣除手續費與證交稅的淨報酬（%）；
-// 另記 30 分鐘內最大有利／不利幅度。bars：Map(分鐘 → 分 K)
+// 每個訊號：多方以訊號價加滑價買進、空方以訊號價減滑價賣出（先賣後買），於 5／15／30 分鐘後與收盤時以收盤價反向平倉（同樣計滑價），
+// 扣除手續費與證交稅的淨報酬（%）；另記 30 分鐘內最大有利／不利幅度。bars：Map(分鐘 → 分 K)
 export function evaluateSignal(sig, bars, p, costs) {
-  if (sig.purpose === 'risk') return null;
+  if (sig.purpose === 'risk') return null; // v2 的風險提醒不是進場訊號
+  const short = sig.side === 'short', dir = short ? -1 : 1, slip = x => tickSize(p, x) * costs.slipTicks;
   const list = [...bars.values()].filter(b => b.c != null).sort((a, b) => a.m - b.m), cost = roundTripCost(costs);
-  const entry = sig.price + tickSize(p, sig.price) * costs.slipTicks, after = list.filter(b => b.m > sig.m);
+  const entry = sig.price + dir * slip(sig.price), after = list.filter(b => b.m > sig.m);
   const exitAt = h => { const b = after.filter(x => x.m <= sig.m + h).at(-1); return b ? b.c : null; };
-  const net = x => x == null ? null : round(((x - tickSize(p, x) * costs.slipTicks) / entry - 1) * 100 - cost);
+  const net = x => x == null ? null : round(dir * ((x - dir * slip(x)) / entry - 1) * 100 - cost);
   const w = after.filter(b => b.m <= sig.m + 30), hi = w.length ? Math.max(...w.map(b => b.h)) : null, lo = w.length ? Math.min(...w.map(b => b.l)) : null;
-  return { r5: net(exitAt(5)), r15: net(exitAt(15)), r30: net(exitAt(30)), rClose: net(list.at(-1)?.c ?? null), mfe: hi == null ? null : round((hi / entry - 1) * 100), mae: lo == null ? null : round((lo / entry - 1) * 100), cost: round(cost, 3) };
+  const move = x => x == null ? null : round(dir * (x / entry - 1) * 100);
+  return { r5: net(exitAt(5)), r15: net(exitAt(15)), r30: net(exitAt(30)), rClose: net(list.at(-1)?.c ?? null), mfe: move(short ? lo : hi), mae: move(short ? hi : lo), cost: round(cost, 3) };
 }
-// 多日訊號紀錄的統計：每種訊號的次數、15 分鐘勝率與平均淨報酬；v2 做多訊號另依訊號當下的大盤環境與相對強弱分組
+// 多日訊號紀錄的統計：每種訊號的次數、15 分鐘勝率與平均淨報酬；v2 以後的訊號另依訊號當下的大盤環境分組，
+// 大盤環境與相對強弱的合計只算多方訊號（空方在順風時不利，混在一起沒有意義）
 const summarize = xs => {
   const avg = k => { const v = xs.map(o => o[k]).filter(n => n != null); return v.length ? round(v.reduce((a, b) => a + b, 0) / v.length) : null; }, v15 = xs.filter(o => o.r15 != null);
   return { n: xs.length, win15: v15.length ? round(v15.filter(o => o.r15 > 0).length / v15.length * 100, 0) : null, r5: avg('r5'), r15: avg('r15'), r30: avg('r30'), rClose: avg('rClose'), mfe: avg('mfe'), mae: avg('mae') };
 };
 const groupBy = (list, keyOf, keys) => keys.map(key => ({ key, ...summarize(list.filter(s => keyOf(s) === key).map(s => s.outcome)) }));
 export function reviewStats(days) {
-  const by = new Map(), v2 = [];
+  const by = new Map(), longs = [];
   for (const d of days) for (const s of d.signals || []) {
     if (!s.outcome || s.purpose === 'risk') continue;
-    const key = `${s.version || 1}:${s.type}`; let x = by.get(key); if (!x) by.set(key, x = { type: s.type, version: s.version || 1, list: [] }); x.list.push(s);
-    if (s.version === 2) v2.push({ ...s, date: d.date });
+    const key = `${s.version || 1}:${s.type}`; let x = by.get(key); if (!x) by.set(key, x = { type: s.type, version: s.version || 1, side: s.side || 'long', list: [] }); x.list.push(s);
+    if (s.version >= 2 && s.side !== 'short') longs.push({ ...s, date: d.date });
   }
-  const regimeRows = [...REGIMES, 'none'], types = [...by.values()].map(({ type, version, list }) => ({ type, version, title: signalTitle({ type, version }), ...summarize(list.map(s => s.outcome)),
-    ...(version === 2 ? { regimes: Object.fromEntries(groupBy(list, regimeKey, regimeRows).map(({ key, ...x }) => [key, x])) } : {}) }));
-  const recorded = v2.filter(s => s.market), complete = recorded.filter(s => regimeOf(s.market));
-  return { days: days.length, signals: types.reduce((a, t) => a + t.n, 0), types: types.sort((a, b) => b.n - a.n), byDay: days.map(d => ({ date: d.date, n: (d.signals || []).length })),
-    market: { signals: v2.length, recorded: complete.length, since: recorded.map(s => s.date).filter(Boolean).sort()[0] || null, rules: MARKET_RULES,
-      regimes: groupBy(v2, regimeKey, regimeRows), strength: groupBy(v2, strengthKey, [...STRENGTHS, 'none']) } };
+  const regimeRows = [...REGIMES, 'none'], types = [...by.values()].map(({ type, version, side, list }) => ({ type, version, side, title: signalTitle({ type, version }), ...summarize(list.map(s => s.outcome)),
+    ...(version >= 2 ? { regimes: Object.fromEntries(groupBy(list, regimeKey, regimeRows).map(({ key, ...x }) => [key, x])) } : {}) }));
+  const recorded = longs.filter(s => s.market), complete = recorded.filter(s => regimeOf(s.market));
+  return { days: days.length, signals: types.reduce((a, t) => a + t.n, 0), types: types.sort((a, b) => b.version - a.version || b.n - a.n), byDay: days.map(d => ({ date: d.date, n: (d.signals || []).length })),
+    market: { signals: longs.length, recorded: complete.length, since: recorded.map(s => s.date).filter(Boolean).sort()[0] || null, rules: MARKET_RULES,
+      regimes: groupBy(longs, regimeKey, regimeRows), strength: groupBy(longs, strengthKey, [...STRENGTHS, 'none']) } };
 }

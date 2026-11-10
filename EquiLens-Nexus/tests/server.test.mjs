@@ -69,10 +69,10 @@ test('local API persists watchlist/evidence, validates settings, blocks cross-or
     // 沒有支援即時推播的資料源金鑰時，雷達維持快照，狀態不顯示推播
     const mon=await(await fetch(base+'monitor')).json();assert.deepEqual([mon.stream.capable,mon.stream.active,mon.stream.symbols],[false,false,0]);
     // 當沖監控：沒有推播資料源時不啟動；設定需 CSRF、數值會被正規化；檢討在沒有紀錄時為空
-    const dtx=await(await fetch(base+'daytrade')).json();assert.deepEqual([dtx.capable,dtx.top.length,dtx.need.full,dtx.cost],[false,0,dtx.need.symbols*3,0.435]);
+    const dtx=await(await fetch(base+'daytrade')).json();assert.deepEqual([dtx.capable,dtx.top.length,dtx.need.full,dtx.cost,dtx.settings.version,dtx.signals,dtx.sources.turnover,dtx.history.total===dtx.sources.total],[false,0,dtx.need.symbols*3,0.435,3,[],0,true]);
     assert.equal((await fetch(base+'daytrade/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"plan":"advanced"}'})).status,403);
-    const dts=await(await fetch(base+'daytrade/settings',{method:'POST',headers,body:JSON.stringify({plan:'advanced',top:999,costs:{feeDiscount:0.28}})})).json();
-    assert.deepEqual([dts.settings.plan,dts.settings.top,dts.settings.costs.feeDiscount,dts.settings.costs.taxRate],['advanced',20,0.28,0.0015]);
+    const dts=await(await fetch(base+'daytrade/settings',{method:'POST',headers,body:JSON.stringify({plan:'advanced',top:999,turnoverTop:100,sources:{watchlist:true},signals:{openLow:false},costs:{feeDiscount:0.28}})})).json();
+    assert.deepEqual([dts.settings.plan,dts.settings.top,dts.settings.turnoverTop,dts.settings.sources,dts.settings.signals,dts.settings.costs.feeDiscount,dts.settings.costs.taxRate],['advanced',30,100,{turnover:true,groups:true,watchlist:true},{maUp:true,maDown:true,openLow:false},0.28,0.0015]);
     assert.equal((await(await fetch(base+'daytrade')).json()).cost,0.23);
     const rv=await(await fetch(base+'daytrade/review')).json();
     assert.deepEqual([rv.days,rv.signals,rv.types.map(x=>[x.type,x.n,x.win15]).sort()],[1,3,[['dt-bid',1,100],['dt-breakout',1,0],['dt-vwap',1,0]]]);

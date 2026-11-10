@@ -63,9 +63,9 @@ test('alerts become concise notifications, batching bursts', () => {
   assert.deepEqual(push.notificationsFor([n(1), n(2, { quiet: true }), a(0)]).map(x => [x.title, x.body, x.url]), [['🗞️ 台積電 2330', '標題1（經濟日報）', 'https://news.example/1'], ['🚀 股0 2330 急拉', '100（+2.5%）· 5 分鐘內 +2.5%', '/#live']]);
   const burst = push.notificationsFor(Array.from({ length: 6 }, (_, i) => n(i)));
   assert.equal(burst.length, 1); assert.equal(burst[0].title, '🗞️ 個股新聞 6 則'); assert.equal(burst[0].url, '/#live');
-  // 當沖：個股訊號照一般格式；不屬於個股的提醒（停止新增部位）只顯示標題與說明
-  const dt = push.notificationsFor([a(0, { type: 'dt-breakout', title: '爆量突破' }), { type: 'dt-stop', stockId: '', name: '', title: '停止新增部位', detail: '13:10 起不再發出當沖訊號' }]);
-  assert.deepEqual(dt.map(x => [x.title, x.body]), [['💥 股0 2330 爆量突破', '100（+2.5%）· 5 分鐘內 +2.5%'], ['⏰ 停止新增部位', '13:10 起不再發出當沖訊號']]);
+  // 個股事件照一般格式；不屬於個股的事件只顯示標題與說明；沒有對應圖示的事件用預設圖示
+  const dt = push.notificationsFor([a(0, { type: 'dt-ma-up', title: '突破 20MA（多方）' }), { type: 'other', stockId: '', name: '', title: '系統提醒', detail: '說明文字' }]);
+  assert.deepEqual(dt.map(x => [x.title, x.body]), [['📈 股0 2330 突破 20MA（多方）', '100（+2.5%）· 5 分鐘內 +2.5%'], ['📡 系統提醒', '說明文字']]);
 });
 
 test('custom alerts are never folded into the radar batch; chip summaries open the chips tab', () => {
@@ -79,23 +79,21 @@ test('custom alerts are never folded into the radar batch; chip summaries open t
   assert.equal(burst.length, 1); assert.match(burst[0].title, /7 則/);
 });
 
-test('day-trade long signals are held and sent as one digest at each 5-minute mark; risk alerts stay immediate', () => {
-  let clock = Date.parse('2026-10-15T09:21:10+08:00');
-  const d = push.createDigest({ now: () => clock });
-  const sig = (type, id, name, extra = {}) => ({ type, stockId: id, name, title: { 'dt-breakout': '多週期爆量突破', 'dt-vwap': '多週期回測轉強', 'dt-risk': '跌破參考停損' }[type], close: 50, change: 2.5, detail: 'x', watch: false, ...extra });
-  const now = d.split([sig('dt-breakout', '2330', '台積電'), sig('dt-risk', '2317', '鴻海'), sig('dt-vwap', '3406', '玉晶光'), { type: 'news', stockId: '2330', name: '台積電', title: '新聞', detail: 'y' }]);
-  assert.deepEqual(now.map(a => a.type), ['dt-risk', 'news'], 'risk alert and news go out immediately');
-  assert.deepEqual(d.due(), [], 'still inside 09:20–09:25');
-  d.split([sig('dt-breakout', '2330', '台積電', { close: 51 })]); // 同一檔同一種訊號：彙整時只留最新
-  clock = Date.parse('2026-10-15T09:25:01+08:00');
-  const held = d.due(); assert.equal(held.length, 3);
-  const n = push.digestNotification(held, clock);
-  assert.match(n.title, /當沖訊號 2 則（09:25 前 5 分鐘）/);
-  assert.match(n.body, /台積電 2330 多週期爆量突破 51/); assert.match(n.body, /玉晶光 3406 多週期回測轉強/);
-  assert.equal(n.tag, `dt-digest:${push.digestSlot(clock)}`);
-  assert.deepEqual(d.due(), [], 'emptied after sending');
-  assert.equal(push.digestNotification([]), null);
-  assert.match(push.digestNotification([sig('dt-vwap', '3406', '玉晶光')]).title, /玉晶光 3406 多週期回測轉強/, 'a single signal keeps the normal format');
+test('day-trade signals from one 5-minute bar go out as a single notification, grouped by long and short', () => {
+  const TITLE = { 'dt-ma-up': '突破 20MA（多方）', 'dt-ma-down': '跌破 20MA（空方）', 'dt-open-low': '跌破開盤低點（空方）' }, SIDE = { 'dt-ma-up': 'long', 'dt-ma-down': 'short', 'dt-open-low': 'short' };
+  const sig = (type, id, name, close = 50) => ({ type, side: SIDE[type], stockId: id, name, title: TITLE[type], close, change: 2.5, detail: '5 分 K 收 50，站上 20MA 49.8', t: '09:35:03', watch: false });
+  const batch = [sig('dt-ma-up', '2330', '台積電', 1455), sig('dt-ma-down', '2317', '鴻海', 201), sig('dt-open-low', '2317', '鴻海', 201), sig('dt-ma-up', '3017', '奇鋐', 1030), { type: 'news', stockId: '2330', name: '台積電', title: '新聞', detail: 'y' }];
+  const { signals, rest } = push.splitDayTrade(batch);
+  assert.deepEqual([signals.length, rest.map(a => a.type)], [4, ['news']], 'other events keep their own notifications');
+  const n = push.dayTradeNotification(signals);
+  assert.match(n.title, /當沖訊號 09:35：多方 2 檔、空方 1 檔/, 'a stock with two short signals counts once');
+  assert.deepEqual(n.body.split('\n'), ['📈 突破 20MA（多方）：台積電 1455、奇鋐 1030', '📉 跌破 20MA（空方）：鴻海 201', '🔻 跌破開盤低點（空方）：鴻海 201']);
+  assert.deepEqual([n.tag, n.url], ['dt:09:35', '/#live']);
+  const many = push.dayTradeNotification(Array.from({ length: 9 }, (_, i) => sig('dt-ma-up', String(1101 + i), `股${i}`)));
+  assert.match(many.body, /股5 50…另 3 檔$/);
+  const one = push.dayTradeNotification([sig('dt-open-low', '3406', '玉晶光')]);
+  assert.match(one.title, /🔻 玉晶光 3406 跌破開盤低點（空方）/, 'a single signal keeps the normal format'); assert.match(one.body, /^50（\+2\.5%）· 5 分 K 收 50/);
+  assert.equal(push.dayTradeNotification([]), null); assert.equal(push.dayTradeNotification(rest), null);
 });
 
 test('store app devices: registered with a public relay, delivered through it, pruned when the relay says gone', async () => {

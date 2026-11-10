@@ -26,7 +26,7 @@ import { EMPTY_SCOPE, validateScope, scopeIds, resolveScope, addGroup, renameGro
 import { patternSnapshot, clearPatterns, updatePatternData } from './lib/pattern-service.mjs';
 import { createStreamPool, splitSymbols, spreadSymbols } from './lib/stream.mjs';
 import { normalizeBooks, checkpoints, buildLiquidity, reduceDay, pickExtras, swapExtras, createBookRecorder, readMeta, writeMeta, compactDay, listBookDays, pruneDays, readStock, toCSV, exportDay } from './lib/bookrec.mjs';
-import { createDayTrade, buildBaseline, normalizeDaytrade, roundTripCost, tzOffset, evaluateSignal, reviewStats, signalTitle, DT_TITLES } from './lib/daytrade.mjs';
+import { createDayTrade, normalizeDaytrade, roundTripCost, tzOffset, evaluateSignal, reviewStats, signalTitle, rankTurnover, selectTurnover, DT_TITLES } from './lib/daytrade.mjs';
 import { createHistoryLoader } from './lib/daytrade-history.mjs';
 import { regimeOf, strengthOf } from './lib/daytrade-market.mjs';
 import { dispositions, tpexDayTrade, callWarrantQuotes } from './lib/providers/twse.mjs';
@@ -195,9 +195,22 @@ function onStreamRows(rows){
   streamState={...streamState,lastAt:Date.now()};
   if(fresh.length)try{runRadar(date,fresh);}catch(e){console.error(t('異動雷達失敗：')+e.message);}
 }
-const streamUniverse=()=>[...new Set([...watchlist,...scopeIds(researchScope),...ruleIds()])];
-// 當沖掃描範圍：預設全部研究族群＋自選（自選排前面，歷史資料與補資料先處理），可在設定改成只掃自選
-const dtScanIds=()=>dtSettings().scope==='watchlist'?[...watchlist]:[...new Set([...watchlist,...scopeIds(researchScope)])];
+// 即時推播訂閱的股票：自選、當沖觀察名單、研究族群、價格提醒；排在前面的優先（方案訂閱數不足時後面的不訂閱）
+const streamUniverse=()=>[...new Set([...watchlist,...(dtSettings().enabled?dtScanIds():[]),...scopeIds(researchScope),...ruleIds()])];
+// 當沖觀察名單：前一日全市場高周轉率個股＋全部研究族群（可在設定各自開關，也可加入自選）。
+// 高周轉率名單來自盤前準備的排行（dtPrep.data.turnover），依設定取成交金額達下限的前 N 名；勾選「只對可當沖股票」時先排除不可當沖、處置與暫停交易
+let dtPickCache={key:'',list:[]};
+function dtTurnoverList(){
+  const s=dtSettings(),d=dtPrep.date===today()?dtPrep.data:null,tv=d?.turnover;
+  if(!s.sources.turnover||!tv?.list?.length)return[];
+  const key=[dtPrep.at,d.date,s.turnoverTop,s.turnoverMinAmount,s.eligibleOnly].join('|');
+  if(dtPickCache.key!==key){
+    const el=s.eligibleOnly&&d.eligible?new Set(d.eligible):null,exclude=new Set(s.eligibleOnly?[...(d.disposition||[]),...(d.suspended||[])]:[]);
+    dtPickCache={key,list:selectTurnover(el?tv.list.filter(x=>el.has(x.id)):tv.list,{top:s.turnoverTop,minAmount:s.turnoverMinAmount,exclude})};
+  }
+  return dtPickCache.list;
+}
+const dtScanIds=()=>{const s=dtSettings().sources;return[...new Set([...(s.watchlist?watchlist:[]),...dtTurnoverList().map(x=>x.id),...(s.groups?scopeIds(researchScope):[])])];};
 // 開盤前 10 分鐘先連線並確認訂閱（台股 08:50），收盤集合競價結束後關閉
 const feedWindow=()=>{const p=M(),x=clock();return x.weekday>=1&&x.weekday<=5&&x.minute>=p.open-10&&x.minute<p.close+p.settle;};
 const dtSettings=()=>normalizeDaytrade(settings.daytrade);
@@ -205,7 +218,8 @@ const dtSettings=()=>normalizeDaytrade(settings.daytrade);
 function streamPlanNow(p,dtReady=true){
   const s=dtSettings(),want=s.plan==='auto'?(dtFallback===today()?'developer':'advanced'):s.plan;
   const planId=p.stream.plan?p.stream.plan(providerInfo()[p.id],want):'developer',plan=p.stream.plans?.[planId]||{limit:300,connections:1,perMinute:600},all=streamUniverse();
-  const full=s.enabled&&dtReady&&dtFallback!==today()&&!!p.stream.channels?.full&&watchlist.length*p.stream.channels.full.length<=plan.limit;
+  // 完整模式（逐筆＋1 分 K＋五檔，每檔 3 個訂閱）：自選與當沖觀察名單都放得下才使用，否則用精簡模式（每檔 1 個）讓觀察名單都有報價
+  const full=s.enabled&&dtReady&&dtFallback!==today()&&!!p.stream.channels?.full&&Math.max(watchlist.length,dtScanIds().length)*p.stream.channels.full.length<=plan.limit;
   const channels=full?p.stream.channels.full:(p.stream.channels?.lite||['aggregates']),ids=all.slice(0,Math.floor(plan.limit/channels.length));
   const groups=full&&plan.connections>1&&ids.length>1?splitSymbols(ids,plan.connections):[ids];
   // 五檔錄製器加錄：用剩下的訂閱數（保留 50 個餘裕），依代號固定分到各連線
@@ -222,7 +236,7 @@ async function streamTick(){
   if(dtSettings().enabled){try{ensureDt();dt.engine.syncIds(streamUniverse());refreshDtMeta(streamUniverse());dtReady=true;}catch(e){dtError=e.message;console.error(t('當沖監控計算失敗：')+e.message);}}
   const plan=streamPlanNow(p,dtReady);
   subscribedIds=new Set(plan.ids);
-  if(dtReady){const e=dt.engine;e.setMode(plan.full?'full':'lite');dtHistory.load({ids:dtScanIds().filter(id=>subscribedIds.has(id)),date:dt.date,source:p.id,engine:e,active:()=>dt?.engine===e&&feedWindow(),interval:Math.ceil(60000/plan.plan.perMinute)+10}).catch(()=>{});}
+  if(dtReady){const e=dt.engine;dtHistory.load({ids:dtScanIds().filter(id=>subscribedIds.has(id)),date:dt.date,source:p.id,engine:e,active:()=>dt?.engine===e&&feedWindow(),interval:Math.ceil(60000/plan.plan.perMinute)+10}).catch(()=>{});}
   if(stream&&streamState.provider!==p.id){stream.close();stream=null;}
   streamState={...streamState,dtError};
   const meta={provider:p.id,mode:plan.full?'full':'lite',plan:plan.planId,limit:plan.plan.limit,perMinute:plan.plan.perMinute,total:plan.total};
@@ -355,29 +369,39 @@ function bookStocks(date){
 function refreshDtMeta(ids){
   const {meta}=uniIndex(),groups=new Map();
   for(const g of researchScope.groups)for(const id of g.stockIds){if(!groups.has(id))groups.set(id,[]);groups.get(id).push(g.id);}
-  for(const id of ids)dtMeta.set(id,{name:meta.get(id)?.name||id,groups:groups.get(id)||[],exchange:meta.get(id)?.market||null});
+  const rate=new Map(dtTurnoverList().map(x=>[x.id,x.rate]));
+  for(const id of ids)dtMeta.set(id,{name:meta.get(id)?.name||id,groups:groups.get(id)||[],exchange:meta.get(id)?.market||null,turnover:rate.get(id)??null});
 }
-// 同時段歷史量：時光機最近 20 個交易日的每分鐘累計量
-function dtBaseline(ids,date){
-  try{const list=[];for(const d of listDays().filter(d=>d<date).slice(-20)){const x=loadDay(d);if(x)list.push({ids:x.ids,frames:x.frames});}return buildBaseline(list,ids,M());}
-  catch(e){console.error(t('當沖監控計算失敗：')+e.message);return{days:0,shape:null,stock:new Map()};} // 歷史量無法建立時以近 20 日均量推估
-}
-// 盤前資料＋本機日 K：近 20 日均量與均額（流動性）、參考價（FinMind 沒有時用前一日收盤）
+// 盤前資料：可當沖資格、處置、暫停交易、參考價（盤前資料沒有時用本機日 K 的前一日收盤）
 function dtPrepFor(date,ids){
-  const d=dtPrep.date===date?dtPrep.data:null,ref=new Map(Object.entries(d?.ref||{})),avgVolume=new Map(),avgAmount=new Map(),lot=M().lot;
-  for(const id of ids){const rows=localDaily(id).filter(r=>r[0]<date).slice(-20);if(!rows.length)continue;avgVolume.set(id,rows.reduce((a,r)=>a+(r[5]||0),0)/rows.length);avgAmount.set(id,rows.reduce((a,r)=>a+(r[5]||0)*(r[4]||0)*lot,0)/rows.length);if(!ref.has(id)&&rows.at(-1)[4]>0)ref.set(id,rows.at(-1)[4]);}
-  const eligible=d?.eligible?new Set(d.eligible):null;
-  return{eligible,disposition:new Set(d?.disposition||[]),suspended:new Set(d?.suspended||[]),sellFirstOff:new Set(d?.sellFirstOff||[]),ref,avgVolume,avgAmount};
+  const d=dtPrep.date===date?dtPrep.data:null,ref=new Map(Object.entries(d?.ref||{}));
+  for(const id of ids){if(ref.has(id))continue;const last=localDaily(id).filter(r=>r[0]<date).at(-1);if(last?.[4]>0)ref.set(id,last[4]);}
+  return{eligible:d?.eligible?new Set(d.eligible):null,disposition:new Set(d?.disposition||[]),suspended:new Set(d?.suspended||[]),sellFirstOff:new Set(d?.sellFirstOff||[]),ref};
 }
 function ensureDt(){
   const date=today();if(dt?.date===date)return dt.engine;
   dtHistory.reset();
   const ids=streamUniverse();refreshDtMeta(ids);
-  const baseline=dtBaseline(ids,date),engine=createDayTrade({market:M(),date,ids,meta:dtMeta,watch:new Set(watchlist),scan:new Set(dtScanIds()),baseline,prep:dtPrepFor(date,ids),settings:settings.daytrade,offset:tzOffset(M().tz),lang:language()});
+  const engine=createDayTrade({market:M(),date,ids,meta:dtMeta,watch:new Set(watchlist),scan:new Set(dtScanIds()),prep:dtPrepFor(date,ids),settings:settings.daytrade,offset:tzOffset(M().tz),lang:language()});
   engine.restore(read(`daytrade/${date}.json`,null)?.signals);
-  dt={date,engine,baselineDays:baseline.days,baselineStocks:baseline.stock.size};return engine;
+  dt={date,engine};return engine;
 }
-// 盤前（台股 08:30 起）：FinMind 的可當沖標的、暫停交易、暫停先賣後買、參考價；證交所／櫃買的處置股
+// 前一交易日全市場周轉率排行（當沖觀察名單用）：成交量與成交金額取自熱浪圖紀錄，沒有紀錄時查一次全市場單日行情；
+// 股數取最近一份集保股權分散表。交易日曆只有平日清單時可能遇到假日，往前最多找 6 個交易日
+async function dtTurnover(date){
+  const lot=M().lot;let cal=[];try{cal=(await tradingDates()).filter(d=>d<date);}catch{}
+  const days=[...new Set([...cal.slice(-6),...heatFiles().filter(d=>d<date).slice(-1)])].sort().reverse();
+  for(const d of days){
+    let h=read('heatmap-'+d+'.json',null);
+    if(!h&&data.has('dailyAll')&&!heatBusy&&!job.running){try{const r=await runHeatmap(d);if(r?.date===d)h=r;}catch{}}
+    const volumes={},amounts={};for(const sec of h?.sectors||[])for(const x of sec.stocks||[])if(x.volume>0){volumes[x.id]=x.volume*lot;amounts[x.id]=x.money;}
+    if(h?.scope==='research'||!Object.keys(volumes).length)continue; // 只有研究名單的熱浪圖不是全市場資料，不能拿來排行
+    const sh=await holderShares(d),list=rankTurnover({volumes,amounts,shares:sh.shares,allow:uniIndex().ids});
+    if(list.length)return{date:d,sharesDate:sh.date,list};
+  }
+  return null;
+}
+// 盤前（台股 08:30 起）：FinMind 的可當沖標的、暫停交易、暫停先賣後買、參考價；證交所／櫃買的處置股；前一交易日周轉率排行
 async function dtPrepare(){
   const date=today();if(dtPrep.busy)return;
   dtPrep={...dtPrep,busy:true};const errors=[];let fin=null,disp=null,otc=null;
@@ -386,9 +410,12 @@ async function dtPrepare(){
   // 上櫃可當沖標的：FinMind 清單只有上市，另向櫃買中心取得（尚未公布時稍後重試）
   try{if(M().id==='TW')otc=await tpexDayTrade(date);}catch(e){errors.push(e.message);}
   const eligible=fin?.eligible||otc?.eligible?[...new Set([...(fin?.eligible||[]),...(otc?.eligible||[])])]:null;
-  const d={date,eligible,tpex:otc?otc.eligible.length:null,suspended:fin?.suspended||[],sellFirstOff:[...new Set([...(fin?.sellFirstOff||[]),...(otc?.sellFirstOff||[])])],ref:fin?.ref||{},disposition:disp?.ids||[],errors:[...errors,...(fin?.errors||[]),...(disp?.errors||[])],source:data.source('dayTrade'),at:new Date().toISOString()};
+  // 周轉率排行當天只需取得一次（重試可當沖清單時沿用）
+  let turnover=dtPrep.data?.date===date?dtPrep.data.turnover||null:null;
+  if(!turnover&&M().id==='TW'){try{turnover=await dtTurnover(date);if(!turnover)errors.push(t('前一交易日的全市場行情或集保股數尚未取得，高周轉率名單暫時是空的'));}catch(e){errors.push(e.message);}}
+  const d={date,turnover,eligible,tpex:otc?otc.eligible.length:null,suspended:fin?.suspended||[],sellFirstOff:[...new Set([...(fin?.sellFirstOff||[]),...(otc?.sellFirstOff||[])])],ref:fin?.ref||{},disposition:disp?.ids||[],errors:[...errors,...(fin?.errors||[]),...(disp?.errors||[])],source:data.source('dayTrade'),at:new Date().toISOString()};
   dtPrep={date,busy:false,data:d,at:Date.now()};write('daytrade-prep.json',d);
-  if(dt?.date===date)dt.engine.setPrep(dtPrepFor(date,dt.engine.ids));
+  if(dt?.date===date){refreshDtMeta(dt.engine.ids);dt.engine.setPrep(dtPrepFor(date,dt.engine.ids));}
 }
 // 斷線重連（或盤中才啟動）後以 REST 補資料：自選股優先；單一執行，兩條連線同時重連只補一次
 async function backfillAll(onlyGaps=false){
@@ -435,7 +462,7 @@ function dtClose(){
 // 每秒：更新分數與排名、偵測訊號（訊號進入異動雷達並推播到手機）
 setInterval(()=>{
   if(!dt||dt.date!==today()||!feedWindow())return;
-  const e=dt.engine;e.setFeed(streamFresh()&&streamState.subscribed>=streamState.expected);e.setMode(streamState.mode);e.setWatch(new Set(watchlist));e.setScan(new Set(dtScanIds()));
+  const e=dt.engine;e.setFeed(streamFresh()&&streamState.subscribed>=streamState.expected);e.setWatch(new Set(watchlist));e.setScan(new Set(dtScanIds()));
   const count=e.signals.length;let alerts=[];try{alerts=e.tick(Date.now());}catch(x){console.error(t('當沖監控計算失敗：')+x.message);}
   if(alerts.length)addAlerts(today(),alerts);
   if(alerts.length||e.signals.length!==count)saveDtLog();
@@ -446,20 +473,26 @@ setInterval(()=>{
   const date=today();
   if(dt?.date===date&&dt.engine.gaps.size&&streamState.connected&&Date.now()-backfill.started>60000)backfillAll(true).catch(()=>{});
   dtIndexFallback().catch(()=>{});
-  if(x.minute>=p.open-30&&x.minute<p.close&&(dtPrep.date!==date||((!dtPrep.data?.eligible||(M().id==='TW'&&dtPrep.data?.tpex==null))&&Date.now()-dtPrep.at>10*60e3&&x.minute<p.open+30)))dtPrepare().catch(()=>{dtPrep={...dtPrep,busy:false};});
+  if(x.minute>=p.open-30&&x.minute<p.close&&(dtPrep.date!==date||((!dtPrep.data?.eligible||(M().id==='TW'&&(dtPrep.data?.tpex==null||!dtPrep.data?.turnover)))&&Date.now()-dtPrep.at>10*60e3&&x.minute<p.open+30)))dtPrepare().catch(()=>{dtPrep={...dtPrep,busy:false};});
   if(x.minute>=p.close+p.settle+1&&dt?.date===date&&dtSaved!==date)try{dtClose();}catch(e){console.error(t('當沖訊號檢討失敗：')+e.message);}
 },20e3).unref();
 const PHASES={pre:'盤前',opening:'開盤觀察',scan:'掃描中',stop:'停止新訊號',auction:'收盤集合競價',closed:'收盤'};
 function dtInfo(){
-  const s=dtSettings(),p=data.pick('stream'),n=streamUniverse().length,e=dt?.date===today()?dt.engine:null,r=e?.ranking(),pd=dtPrep.date===today()?dtPrep.data:null;
+  const s=dtSettings(),p=data.pick('stream'),n=streamUniverse().length,scanIds=dtScanIds(),e=dt?.date===today()?dt.engine:null,r=e?.ranking(),pd=dtPrep.date===today()?dtPrep.data:null;
   const plan=p?.stream?.plan?p.stream.plan(providerInfo()[p.id],s.plan==='auto'?(dtFallback===today()?'developer':'advanced'):s.plan):null;
+  const hs=dtHistory.status(scanIds),rows=(r?.list||[]).filter(x=>x.scan),picks=dtTurnoverList(),tv=pd?.turnover;
   return{enabled:s.enabled,capable:!!p,provider:p?.id||null,settings:s,cost:Math.round(roundTripCost(s.costs)*1000)/1000,
-    history:dtHistory.status(dtScanIds()),scope:s.scope,
-    need:{symbols:n,watched:watchlist.length,scanned:dtScanIds().length,full:n*(p?.stream?.channels?.full?.length||3),lite:n},plans:p?.stream?.plans||null,plan,fallback:dtFallback===today(),
+    history:{total:hs.length,ready:hs.filter(x=>x.status==='ready').length,short:hs.filter(x=>x.status==='incomplete').length,errors:hs.filter(x=>x.error).slice(0,3).map(x=>({id:x.id,error:x.error}))},
+    // 觀察名單的組成（同一檔可能同時屬於兩種來源）
+    sources:{total:scanIds.length,subscribed:scanIds.filter(id=>subscribedIds.has(id)).length,turnover:picks.length,groups:s.sources.groups?scopeIds(researchScope).length:0,watchlist:s.sources.watchlist?watchlist.length:0},
+    need:{symbols:n,watched:watchlist.length,scanned:scanIds.length,full:n*(p?.stream?.channels?.full?.length||3),lite:n},plans:p?.stream?.plans||null,plan,fallback:dtFallback===today(),
     feed:{...streamInfo(),window:feedWindow(),backfill:{busy:backfill.busy,done:backfill.done,total:backfill.total,error:backfill.error},pending:e?e.gaps.size:0},
-    prep:pd?{date:pd.date,eligible:pd.eligible?pd.eligible.length:null,tpex:pd.tpex??null,disposition:pd.disposition.length,suspended:pd.suspended.length,sellFirstOff:pd.sellFirstOff.length,ref:Object.keys(pd.ref||{}).length,errors:pd.errors,at:pd.at}:null,
-    baselineDays:dt?.baselineDays??null,baselineStocks:dt?.baselineStocks??null,phase:e&&feedWindow()?e.phase(Date.now()):null,phaseName:e&&feedWindow()?PHASES[e.phase(Date.now())]:null,
-    asOf:r?.at||null,marketChange:r?.marketChange??null,market:e&&feedWindow()?e.marketState(Date.now()):null,top:(r?.list||[]).filter(x=>x.scan&&!x.filters.length&&x.score>=s.displayMin).slice(0,s.top),hidden:(r?.list||[]).filter(x=>x.scan&&x.score<s.displayMin).length,displayMin:s.displayMin,excluded:(r?.list||[]).filter(x=>x.scan).reduce((out,x)=>{for(const key of x.filters)out[key]=(out[key]||0)+1;return out;},{}),watched:watchlist.map(id=>(r?.list||[]).find(x=>x.id===id)||{id,name:dtMeta.get(id)?.name||id,watch:true,score:0,part:{},filters:[],pending:true,context:{ready:false,reasons:[subscribedIds.has(id)?'waitingQuote':'subscription']}}).filter(x=>x.score>=s.displayMin),total:dtScanIds().length,signals:(e?.signals||[]).slice(-30).reverse()};
+    prep:pd?{date:pd.date,eligible:pd.eligible?pd.eligible.length:null,tpex:pd.tpex??null,disposition:pd.disposition.length,suspended:pd.suspended.length,sellFirstOff:pd.sellFirstOff.length,ref:Object.keys(pd.ref||{}).length,
+      turnover:tv?{date:tv.date,sharesDate:tv.sharesDate,ranked:tv.list.length,picked:picks.length,minRate:picks.at(-1)?.rate??null}:null,errors:pd.errors,at:pd.at}:null,
+    phase:e&&feedWindow()?e.phase(Date.now()):null,phaseName:e&&feedWindow()?PHASES[e.phase(Date.now())]:null,
+    asOf:r?.at||null,marketChange:r?.marketChange??null,market:e&&feedWindow()?e.marketState(Date.now()):null,
+    counts:r?.counts||null,excluded:r?.excluded||{},top:rows.slice(0,s.top),total:scanIds.length,listed:rows.length,
+    signals:(e?.signals||[]).slice(-60).reverse().map(({type,side,id,name,t,price,detail,turnover,bar})=>({type,side,id,name,t,price,detail,turnover:turnover??null,bar:bar?{close:bar.close,ma20:bar.ma20,openLow:bar.openLow}:null})),signalCount:e?.signals.length||0};
 }
 // 個股即時走勢（手機版與電腦版點個股）：每分鐘價量、當日均價線、所屬族群均價線、五檔、最近成交。
 // 來源依序：當沖引擎的即時推播（逐筆、1 分 K、五檔）→ 富果盤中 REST（未訂閱即時推播的股票；3 次請求，3 秒內共用）→ 時光機每分鐘畫格。
@@ -524,7 +557,7 @@ function indexSummary(){
 function dtReview(){
   const dir=path.join(LOCAL,'daytrade');let files=[];try{files=fs.readdirSync(dir).filter(f=>/^\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort().slice(-60);}catch{}
   const days=files.map(f=>read(`daytrade/${f}`,null)).filter(d=>d?.closedAt);
-  return{...reviewStats(days),cost:Math.round(roundTripCost(dtSettings().costs)*1000)/1000,recent:days.slice(-5).reverse().map(d=>({date:d.date,mode:d.mode,signals:d.signals.map(({type,id,name,t,price,score,outcome,purpose,reference,version,market})=>({purpose,reference,version,type,title:signalTitle({type,version}),id,name,t,price,score,outcome,market:market||null,regime:regimeOf(market),strength:strengthOf(market)}))}))};
+  return{...reviewStats(days),cost:Math.round(roundTripCost(dtSettings().costs)*1000)/1000,recent:days.slice(-5).reverse().map(d=>({date:d.date,mode:d.mode,signals:d.signals.map(({type,side,id,name,t,price,score,outcome,purpose,reference,version,market})=>({purpose,side:side||null,reference,version,type,title:signalTitle({type,version}),id,name,t,price,score,outcome,market:market||null,regime:regimeOf(market),strength:strengthOf(market)}))}))};
 }
 
 /* ---------- 異動雷達 ---------- */
@@ -1310,7 +1343,7 @@ const server = http.createServer(async (req,res) => {
     if(route==='/api/daytrade/review'&&req.method==='GET')return json(res,200,dtReview());
     if(route==='/api/daytrade/settings'&&req.method==='POST'){
       const b=await body(req);if(!b||typeof b!=='object'||Array.isArray(b))throw new UserError('當沖監控設定格式錯誤');
-      settings={...settings,daytrade:normalizeDaytrade({...dtSettings(),...b,signals:{...dtSettings().signals,...b.signals},costs:{...dtSettings().costs,...b.costs}})};saveSettings();
+      settings={...settings,daytrade:normalizeDaytrade({...dtSettings(),...b,version:dtSettings().version,sources:{...dtSettings().sources,...b.sources},signals:{...dtSettings().signals,...b.signals},costs:{...dtSettings().costs,...b.costs}})};saveSettings();
       if(dt)dt.engine.setSettings(settings.daytrade);
       return json(res,200,{ok:true,settings:settings.daytrade});
     }

@@ -255,8 +255,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.join(ROOT, 'server
   server.on('error', e => { console.error(e.code === 'EADDRINUSE' ? `連接埠 ${PORT} 已使用` : '手機版服務啟動失敗'); process.exit(1); });
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => server.close(() => process.exit(0)));
   // 推播轉送：每 2 秒向 Nexus（本機）取新的雷達／日報事件，推到已開啟通知的手機；只推 10 分鐘內的事件，避免重啟後補發舊訊息。
-  // 當沖做多訊號先累積，每到整 5 分鐘彙整成一則推播；風險提醒與其他事件立即推播。
-  let relayBusy = false; const digest = push.createDigest();
+  // 當沖訊號在每根 5 分 K 走完時一起產生：同一批合成一則推播（分多方、空方列出）；其他事件各自推播。
+  let relayBusy = false;
   setInterval(async () => {
     if (relayBusy) return; relayBusy = true;
     try {
@@ -264,12 +264,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.join(ROOT, 'server
       if (r.latest > push.lastSeq()) {
         const fresh = r.alerts.filter(a => Date.now() - Date.parse(a.at) < 10 * 60e3);
         await profile();
-        const now = digest.split(fresh);
-        if (push.subscriptionCount()) for (const n of push.notificationsFor(now)) await push.sendToAll(n);
+        const { signals, rest } = push.splitDayTrade(fresh), dayTrade = push.dayTradeNotification(signals);
+        if (push.subscriptionCount()) for (const n of [...push.notificationsFor(rest), ...(dayTrade ? [dayTrade] : [])]) await push.sendToAll(n);
         push.setLastSeq(r.latest);
       }
-      const held = digest.due(), n = push.digestNotification(held);
-      if (n && push.subscriptionCount()) await push.sendToAll(n);
     } catch { } finally { relayBusy = false; }
   }, 2000).unref();
 }

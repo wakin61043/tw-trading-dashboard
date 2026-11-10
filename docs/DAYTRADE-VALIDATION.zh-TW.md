@@ -1,5 +1,7 @@
 # 當沖提醒 v2 驗證紀錄
 
+> 這份紀錄針對舊版（v2，多週期確認）。目前的版本是 v3（只看 5 分 K），規則見[當沖監控](DAYTRADE.zh-TW.md)。
+
 驗證日期：2026-10-15（Asia/Taipei）。實作基準：`a60153c`，分支 `codex/daytrade-multiframe-alerts`。環境：Windows、Node.js v24.15.0。
 
 ## 已完成

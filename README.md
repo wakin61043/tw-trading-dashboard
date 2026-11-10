@@ -36,15 +36,16 @@ component's `.local/` folder; API keys are encrypted by the operating system (se
   watchlist and research groups, plus a live board with daily / 5-minute candles. **Custom alerts** let you set price,
   % change or projected-volume conditions on any stock; they are pushed to your phone when met (one-time or repeating). With a Fugle key the radar runs on a
   WebSocket live stream (watchlist first, up to your plan's limit) instead of periodic snapshots.
-- **Day-trade monitoring** (Taiwan, FinMind + Fugle) – Watchlist alerts combine the previous 30 daily candles,
-  completed 60-minute and 5-minute candles, same-slot historical volume and a continuous live five-level book window.
-  Three long setups are accompanied by weakness and reference-stop alerts; risk alerts continue after the entry cutoff.
-  Missing history, stale data or an incomplete feed pause confirmation. Each stock shows its evidence and readiness;
-  v1/v2 after-close outcome statistics remain separate. See [the rules and limitations](docs/DAYTRADE.zh-TW.md).
+- **Day-trade monitoring** (Taiwan, FinMind + Fugle) – 5-minute bars only. The watch list is the previous session's
+  highest-turnover stocks across the whole market (top 50 with at least NT$100M traded, by default) plus every stock in
+  your research groups. A 5-minute close above the 20MA is a long signal; a close below the 20MA, or below the opening
+  low (the low of the day's first 5-minute bar), is a short signal. Each bar is checked once when it ends, and the
+  signals of one bar go out as a single phone notification. After the close every signal is reviewed net of costs.
+  Alerts only, no orders. See [the rules and limitations](docs/DAYTRADE.zh-TW.md).
   Each signal also records the state of its own index (TAIEX for listed stocks, TPEx for OTC stocks: change, 15-minute
   change, position against the intraday average) and the stock's relative strength; the review groups outcomes by
-  tailwind / neutral / headwind and stronger / weaker than the market. This is recorded only — scores, thresholds and
-  alerts are unchanged ([details, zh-TW](docs/features/daytrade-market.md)).
+  tailwind / neutral / headwind. This is recorded only — signals and alerts are unchanged
+  ([details, zh-TW](docs/features/daytrade-market.md)).
 - **Group ranking** – your research groups ranked by turnover-weighted gain, with daily close records.
 - **Pattern scanner** – 10 classic patterns over 90 sessions with conditional entry and stop levels.
 - **AI after-market report** – written by Claude, OpenAI, Gemini or any OpenAI-compatible endpoint (including local

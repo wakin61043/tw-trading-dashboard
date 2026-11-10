@@ -101,32 +101,20 @@ export function setLastSeq(seq) { const s = store(); s.lastSeq = seq; save(s); }
 // 通知文字依 Nexus 的介面語言翻譯
 export const localize = n => ({ ...n, title: tx(n.title), body: n.body ? tx(n.body) : n.body });
 // 將雷達、新聞與日報事件轉成通知；同一批太多時合併成一則摘要。
-const ICON = { volume: '🔥', 'surge-up': '🚀', 'surge-down': '⚡', 'limit-up': '🔺', 'limit-down': '🔻', 'limit-up-open': '⚠️', 'limit-down-open': '↗️', 'pattern-entry': '🎯', stop: '🛑', report: '📰', news: '🗞️', 'dt-breakout': '💥', 'dt-vwap': '📈', 'dt-bid': '🟢', 'dt-stop': '⏰', 'dt-weak': '⚠️', 'dt-risk': '🛑', custom: '🔔', broker: '🏦', holders: '🐋' };
+const ICON = { volume: '🔥', 'surge-up': '🚀', 'surge-down': '⚡', 'limit-up': '🔺', 'limit-down': '🔻', 'limit-up-open': '⚠️', 'limit-down-open': '↗️', 'pattern-entry': '🎯', stop: '🛑', report: '📰', news: '🗞️', 'dt-ma-up': '📈', 'dt-ma-down': '📉', 'dt-open-low': '🔻', custom: '🔔', broker: '🏦', holders: '🐋' };
 export function notificationsFor(alerts) { return build(alerts).map(localize); }
-// 當沖做多訊號每 5 分鐘彙整成一則推播（在整 5 分鐘時送出，例如 09:20、09:25）；
-// 多單轉弱、跌破參考停損、停止新增部位等風險提醒不彙整，仍立即推播。
-export const DT_DIGEST_TYPES = new Set(['dt-breakout', 'dt-vwap', 'dt-bid']);
-export const DIGEST_MS = 5 * 60e3;
-export const digestSlot = (t, ms = DIGEST_MS) => Math.floor(t / ms) * ms; // 台北時差是整點，UTC 的 5 分鐘格線與當地一致
-export function createDigest({ ms = DIGEST_MS, now = Date.now } = {}) {
-  let held = [], slot = digestSlot(now(), ms);
-  return {
-    // 分出要彙整的訊號，其餘回傳立即推播
-    split(alerts) { const later = alerts.filter(a => DT_DIGEST_TYPES.has(a.type)); held.push(...later); return alerts.filter(a => !DT_DIGEST_TYPES.has(a.type)); },
-    // 跨過整 5 分鐘時，回傳上一段時間累積的訊號（沒有就回傳空陣列）
-    due() { const s = digestSlot(now(), ms); if (s === slot) return []; slot = s; const out = held; held = []; return out; },
-    get size() { return held.length; },
-  };
-}
-export function digestNotification(alerts, at = Date.now()) {
-  if (!alerts.length) return null;
-  const latest = new Map(); for (const a of alerts) latest.set(`${a.stockId}:${a.type}`, a); // 同一檔同一種訊號只留最新一則
-  const list = [...latest.values()];
-  if (list.length === 1) return build(list).map(localize)[0];
-  const hm = new Date(digestSlot(at)).toLocaleTimeString('en-GB', { timeZone: 'Asia/Taipei', hour: '2-digit', minute: '2-digit', hour12: false });
-  const lines = list.slice(0, 8).map(a => `${ICON[a.type] || '📡'} ${a.name} ${a.stockId} ${tx(a.title)} ${a.close ?? ''}（${a.change > 0 ? '+' : ''}${a.change ?? '—'}%）`);
-  if (list.length > 8) lines.push(t('…另 {n} 則', { n: list.length - 8 }));
-  return { title: t('📡 當沖訊號 {n} 則（{time} 前 5 分鐘）', { n: list.length, time: hm }), body: lines.join('\n'), tag: `dt-digest:${digestSlot(at)}`, url: '/#live' };
+// 當沖訊號（5 分 K 突破／跌破 20MA、跌破開盤低點）在每根 5 分 K 走完時一起產生：同一批合成一則推播，分多方、空方列出；
+// 只有一則時用一般格式。其餘事件照常各自推播。
+export const DT_SIGNAL_TYPES = new Set(['dt-ma-up', 'dt-ma-down', 'dt-open-low']);
+export function splitDayTrade(alerts) { return { signals: alerts.filter(a => DT_SIGNAL_TYPES.has(a.type)), rest: alerts.filter(a => !DT_SIGNAL_TYPES.has(a.type)) }; }
+export function dayTradeNotification(alerts) {
+  const list = (alerts || []).filter(a => DT_SIGNAL_TYPES.has(a.type)); if (!list.length) return null;
+  const time = String(list.at(-1).t || '').slice(0, 5);
+  if (list.length === 1) { const a = list[0]; return localize({ title: `${ICON[a.type]} ${a.name} ${a.stockId} ${a.title}`, body: `${a.close}（${a.change > 0 ? '+' : ''}${a.change ?? '—'}%）· ${a.detail}`, tag: `${a.type}:${a.stockId}:${time}`, url: '/#live' }); }
+  const count = side => new Set(list.filter(a => a.side === side).map(a => a.stockId)).size, groups = new Map();
+  for (const a of list) { if (!groups.has(a.type)) groups.set(a.type, { title: a.title, items: [] }); groups.get(a.type).items.push(a); }
+  const lines = [...DT_SIGNAL_TYPES].filter(k => groups.has(k)).map(k => { const g = groups.get(k), shown = g.items.slice(0, 6).map(a => `${a.name} ${a.close ?? ''}`.trim()); return `${ICON[k]} ${tx(g.title)}：${shown.join('、')}${g.items.length > 6 ? t('…另 {n} 檔', { n: g.items.length - 6 }) : ''}`; });
+  return { title: t('📡 當沖訊號 {time}：多方 {long} 檔、空方 {short} 檔', { time, long: count('long'), short: count('short') }), body: lines.join('\n'), tag: `dt:${time}`, url: '/#live' };
 }
 function build(alerts) {
   if (!alerts.length) return [];
